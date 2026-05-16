@@ -517,7 +517,9 @@ renderCUDA(
 			const float2 xy = collected_xy[j];
 			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			const float4 con_o = collected_conic_opacity[j];
-			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			float2 dscale;
+			const float2 d_corr = correctedOmniDelta(d, xy, pixf, H, dscale);
+			const float power = -0.5f * (con_o.x * d_corr.x * d_corr.x + con_o.z * d_corr.y * d_corr.y) - con_o.y * d_corr.x * d_corr.y;
 			if (power > 0.0f)
 				continue;
 
@@ -561,19 +563,19 @@ renderCUDA(
 
 			// Helpful reusable temporary variables
 			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+			const float gdx = G * d_corr.x;
+			const float gdy = G * d_corr.y;
+			const float dG_ddelx = dscale.x * (-gdx * con_o.x - gdy * con_o.y);
+			const float dG_ddely = dscale.y * (-gdy * con_o.z - gdx * con_o.y);
 
 			// Update gradients w.r.t. 2D mean position of the Gaussian
 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d_corr.x * dL_dG);
+			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d_corr.y * dL_dG);
+			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d_corr.y * dL_dG);
 
 			// Update gradients w.r.t. opacity of the Gaussian
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);

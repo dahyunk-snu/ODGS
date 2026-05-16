@@ -348,7 +348,11 @@ renderCUDA(
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
-			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			float2 dscale;
+			float2 d_corr = correctedOmniDelta(d, xy, pixf, H, dscale);
+			// Radius/tile culling still uses the center covariance, so
+			// strongly corrected footprints may need a larger future bound.
+			float power = -0.5f * (con_o.x * d_corr.x * d_corr.x + con_o.z * d_corr.y * d_corr.y) - con_o.y * d_corr.x * d_corr.y;
 			if (power > 0.0f)
 				continue;
 

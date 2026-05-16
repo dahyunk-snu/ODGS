@@ -43,6 +43,42 @@ __forceinline__ __device__ float ndc2Pix(float v, int S)
 	return ((v + 1.0) * S - 1.0) * 0.5;
 }
 
+__forceinline__ __device__ float omniLatFromPixelY(float y, int H)
+{
+	const float pi = 3.14159265358979323846f;
+	return (0.5f - y / (float)H) * pi;
+}
+
+__forceinline__ __device__ float2 correctedOmniDelta(const float2 d, const float2 mean, const float2 pix, int H, float2& dscale)
+{
+	const float corr_cos_eps = 1e-4f;
+	const float corr_min_scale = 0.5f;
+	const float corr_max_scale = 2.0f;
+	const float corr_hard_min_scale = 0.25f;
+	const float corr_hard_max_scale = 4.0f;
+	const float corr_min_effect = 1e-4f;
+
+	dscale = { 1.0f, 1.0f };
+
+	const float theta = omniLatFromPixelY(pix.y, H);
+	const float theta0 = omniLatFromPixelY(mean.y, H);
+	const float c = cosf(theta);
+	const float c0 = cosf(theta0);
+
+	if (isfinite(c) && isfinite(c0) && fabsf(c) > corr_cos_eps && fabsf(c0) > corr_cos_eps)
+	{
+		float sx = c / c0;
+		if (isfinite(sx) && sx >= corr_hard_min_scale && sx <= corr_hard_max_scale)
+		{
+			sx = fminf(corr_max_scale, fmaxf(corr_min_scale, sx));
+			if (fabsf(sx - 1.0f) >= corr_min_effect)
+				dscale.x = sx;
+		}
+	}
+
+	return { dscale.x * d.x, dscale.y * d.y };
+}
+
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
 {
 	rect_min = {
