@@ -140,8 +140,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-        if check_100m == 0:
-            break
+        # if check_100m == 0:
+        #     break
 
 
 def prepare_output_and_logger(args):    
