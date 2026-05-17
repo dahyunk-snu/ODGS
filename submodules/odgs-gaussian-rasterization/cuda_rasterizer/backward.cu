@@ -515,7 +515,8 @@ renderCUDA(
 
 			// Compute blending values, as before.
 			const float2 xy = collected_xy[j];
-			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const OmniLogMapDeltaResult lm = logMapOmniDeltaPixelWithMeanJacobian(pixf, xy, W, H);
+			const float2 d = lm.d;
 			const float4 con_o = collected_conic_opacity[j];
 			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
@@ -565,10 +566,14 @@ renderCUDA(
 			const float gdy = G * d.y;
 			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+			const float dL_ddelx = dL_dG * dG_ddelx;
+			const float dL_ddely = dL_dG * dG_ddely;
+			const float dL_dmean_x = dL_ddelx * lm.ddx_dmx + dL_ddely * lm.ddy_dmx;
+			const float dL_dmean_y = dL_ddelx * lm.ddx_dmy + dL_ddely * lm.ddy_dmy;
 
 			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+			atomicAdd(&dL_dmean2D[global_id].x, dL_dmean_x * ddelx_dx);
+			atomicAdd(&dL_dmean2D[global_id].y, dL_dmean_y * ddely_dy);
 
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
