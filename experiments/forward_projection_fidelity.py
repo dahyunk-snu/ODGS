@@ -112,8 +112,17 @@ def monte_carlo_ray_hits(mean, sigma, width, height, samples, chunk, seed, devic
     return hist / hist.sum().clamp_min(1.0)
 
 
-def normalize(image):
-    return image / image.max().clamp_min(1.0e-12)
+def center_intensity(image, center_x, center_y):
+    h, w = image.shape
+    x = int(round(center_x))
+    y = int(round(center_y))
+    x = min(max(x, 0), w - 1)
+    y = min(max(y, 0), h - 1)
+    return image[y, x]
+
+
+def normalize_by_center(image, center_x, center_y):
+    return image / center_intensity(image, center_x, center_y).clamp_min(1.0e-12)
 
 
 def crop_centered(image, center_x, center_y, crop_size):
@@ -185,7 +194,7 @@ def save_l1_plot(rows, sigmas, out_path):
         sigma_rows.sort(key=lambda r: r["theta_deg"])
         ax.plot(
             [r["theta_deg"] for r in sigma_rows],
-            [r["l1_normalized"] for r in sigma_rows],
+            [r["l1_center_normalized"] for r in sigma_rows],
             marker="o",
             markersize=2.4,
             linewidth=1.5,
@@ -193,8 +202,8 @@ def save_l1_plot(rows, sigmas, out_path):
         )
 
     ax.set_xlabel("theta (deg)")
-    ax.set_ylabel("L1 loss")
-    ax.set_title("Renderer vs Monte Carlo L1")
+    ax.set_ylabel("Center-normalized L1 loss")
+    ax.set_title("Renderer vs Monte Carlo Center-normalized L1")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.savefig(out_path, dpi=180)
@@ -279,15 +288,19 @@ def main():
                     device,
                 )
 
-                renderer_norm = normalize(rendered["image"]).detach().cpu().numpy()
-                mc_norm = normalize(mc).detach().cpu().numpy()
-                diff = renderer_norm - mc_norm
-                l1 = float(np.mean(np.abs(diff)))
-
                 theta_rad = math.radians(theta)
                 phi_rad = math.radians(args.phi)
                 center_x = (phi_rad / math.pi + 1.0) * args.width * 0.5
                 center_y = (0.5 - theta_rad / math.pi) * args.height
+                renderer_center = center_intensity(rendered["image"], center_x, center_y)
+                mc_center = center_intensity(mc, center_x, center_y)
+
+                renderer_norm = (
+                    normalize_by_center(rendered["image"], center_x, center_y).detach().cpu().numpy()
+                )
+                mc_norm = normalize_by_center(mc, center_x, center_y).detach().cpu().numpy()
+                diff = renderer_norm - mc_norm
+                l1 = float(np.mean(np.abs(diff)))
 
                 if sigma_key(sigma) in visual_sigma_keys and theta_key(theta) in visual_theta_keys:
                     case = {
@@ -307,7 +320,7 @@ def main():
                         {
                             "sigma": sigma,
                             "theta_deg": theta,
-                            "l1_normalized": l1,
+                            "l1_center_normalized": l1,
                         }
                     )
 
@@ -315,10 +328,12 @@ def main():
                     {
                         "sigma": sigma,
                         "theta_deg": theta,
-                        "mse_normalized": float(np.mean(diff * diff)),
-                        "mae_normalized": l1,
+                        "mse_center_normalized": float(np.mean(diff * diff)),
+                        "mae_center_normalized": l1,
                         "renderer_peak": float(rendered["image"].max().detach().cpu()),
                         "mc_peak_probability": float(mc.max().detach().cpu()),
+                        "renderer_center_intensity": float(renderer_center.detach().cpu()),
+                        "mc_center_probability": float(mc_center.detach().cpu()),
                         "renderer_radius_px": int(rendered["radii"][0].detach().cpu()),
                         "renderer_lat_rad": float(rendered["lat"][0].detach().cpu()),
                         "renderer_lon_rad": float(rendered["lon"][0].detach().cpu()),
