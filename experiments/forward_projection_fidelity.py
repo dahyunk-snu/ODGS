@@ -84,32 +84,31 @@ def render_single_gaussian(camera, mean, sigma, opacity, device):
 
 
 @torch.no_grad()
-def monte_carlo_ray_hits(mean, sigma, width, height, samples, chunk, seed, device):
-    hist = torch.zeros(height * width, dtype=torch.float32, device=device)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
+def raytrace_single_gaussian(mean, sigma, opacity, width, height, footprint_radius, device):
+    ys, xs = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32, device=device),
+        torch.arange(width, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    lon = (xs * 2.0 / width - 1.0) * math.pi
+    lat = (0.5 - ys / height) * math.pi
+    dirs = torch.stack(
+        [torch.cos(lat) * torch.sin(lon), -torch.sin(lat), torch.cos(lat) * torch.cos(lon)],
+        dim=-1,
+    )
+    t = (dirs * mean).sum(dim=-1)
+    dist2 = ((mean * mean).sum() - t.square()).clamp_min(0.0)
+    line_integral = 0.5 * torch.exp(-0.5 * dist2 / (sigma * sigma)) * torch.erfc(
+        -t / (math.sqrt(2.0) * sigma)
+    )
+    alpha = torch.clamp(opacity * line_integral, max=0.99)
 
-    done = 0
-    while done < samples:
-        n = min(chunk, samples - done)
-        pts = mean.reshape(1, 3) + sigma * torch.randn(
-            (n, 3), dtype=torch.float32, device=device, generator=gen
-        )
-        dist_xz = torch.sqrt(pts[:, 0] * pts[:, 0] + pts[:, 2] * pts[:, 2])
-        dist = torch.linalg.norm(pts, dim=1)
-        valid = dist > 1.0e-6
-
-        lon = torch.atan2(pts[valid, 0], pts[valid, 2])
-        lat = torch.atan2(-pts[valid, 1], dist_xz[valid])
-        u = ((lon / math.pi + 1.0) * width * 0.5).floor().long().clamp(0, width - 1)
-        v = ((0.5 - lat / math.pi) * height).floor().long().clamp(0, height - 1)
-
-        idx = v * width + u
-        hist += torch.bincount(idx, minlength=height * width).to(hist.dtype)
-        done += n
-
-    hist = hist.reshape(height, width)
-    return hist / hist.sum().clamp_min(1.0)
+    dist_xz = torch.sqrt(mean[0] * mean[0] + mean[2] * mean[2])
+    center_x = ((torch.atan2(mean[0], mean[2]) / math.pi + 1.0) * width * 0.5).item()
+    center_y = ((0.5 - torch.atan2(-mean[1], dist_xz) / math.pi) * height).item()
+    radius = footprint_radius.item()
+    footprint = (xs - center_x).abs().le(radius) & (ys - center_y).abs().le(radius)
+    return torch.where(footprint & (alpha >= 1.0 / 255.0), alpha, torch.zeros_like(alpha))
 
 
 def center_intensity(image, center_x, center_y):
@@ -119,10 +118,6 @@ def center_intensity(image, center_x, center_y):
     x = min(max(x, 0), w - 1)
     y = min(max(y, 0), h - 1)
     return image[y, x]
-
-
-def normalize_by_center(image, center_x, center_y):
-    return image / center_intensity(image, center_x, center_y).clamp_min(1.0e-12)
 
 
 def crop_centered(image, center_x, center_y, crop_size):
@@ -168,7 +163,7 @@ def save_visualization(cases, sigmas, thetas, out_path):
             case = case_lookup[(sigma_key(sigma), theta_key(theta))]
             panels = [
                 ("renderer", case["renderer_crop"], "magma", 0.0, 1.0),
-                ("mc ray hit", case["mc_crop"], "magma", 0.0, 1.0),
+                ("ray trace", case["raytrace_crop"], "magma", 0.0, 1.0),
                 ("diff", case["diff_crop"], "coolwarm", -1.0, 1.0),
             ]
             for panel_idx, (name, image, cmap, vmin, vmax) in enumerate(panels):
@@ -194,7 +189,7 @@ def save_l1_plot(rows, sigmas, out_path):
         sigma_rows.sort(key=lambda r: r["theta_deg"])
         ax.plot(
             [r["theta_deg"] for r in sigma_rows],
-            [r["l1_center_normalized"] for r in sigma_rows],
+            [r["l1"] for r in sigma_rows],
             marker="o",
             markersize=2.4,
             linewidth=1.5,
@@ -202,8 +197,8 @@ def save_l1_plot(rows, sigmas, out_path):
         )
 
     ax.set_xlabel("theta (deg)")
-    ax.set_ylabel("Center-normalized L1 loss")
-    ax.set_title("Renderer vs Monte Carlo Center-normalized L1")
+    ax.set_ylabel("L1 loss")
+    ax.set_title("Renderer vs Ray-traced L1")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.savefig(out_path, dpi=180)
@@ -231,9 +226,6 @@ def main():
     parser.add_argument("--loss-theta-min", type=float, default=0.0)
     parser.add_argument("--loss-theta-max", type=float, default=89.0)
     parser.add_argument("--loss-theta-step", type=float, default=1.0)
-    parser.add_argument("--samples", type=int, default=1_000_000)
-    parser.add_argument("--chunk", type=int, default=250_000)
-    parser.add_argument("--seed", type=int, default=3)
     parser.add_argument("--crop-size", type=int, default=512)
     parser.add_argument(
         "--out-dir",
@@ -277,14 +269,13 @@ def main():
             for theta in all_thetas:
                 mean = spherical_mean(args.radius, theta, args.phi, device)
                 rendered = render_single_gaussian(camera, mean, sigma, args.opacity, device)
-                mc = monte_carlo_ray_hits(
+                raytrace = raytrace_single_gaussian(
                     mean,
                     sigma,
+                    args.opacity,
                     args.width,
                     args.height,
-                    args.samples,
-                    args.chunk,
-                    args.seed,
+                    rendered["radii"][0],
                     device,
                 )
 
@@ -293,24 +284,22 @@ def main():
                 center_x = (phi_rad / math.pi + 1.0) * args.width * 0.5
                 center_y = (0.5 - theta_rad / math.pi) * args.height
                 renderer_center = center_intensity(rendered["image"], center_x, center_y)
-                mc_center = center_intensity(mc, center_x, center_y)
+                raytrace_center = center_intensity(raytrace, center_x, center_y)
 
-                renderer_norm = (
-                    normalize_by_center(rendered["image"], center_x, center_y).detach().cpu().numpy()
-                )
-                mc_norm = normalize_by_center(mc, center_x, center_y).detach().cpu().numpy()
-                diff = renderer_norm - mc_norm
+                renderer_image = rendered["image"].detach().cpu().numpy()
+                raytrace_image = raytrace.detach().cpu().numpy()
+                diff = renderer_image - raytrace_image
                 l1 = float(np.mean(np.abs(diff)))
 
                 if sigma_key(sigma) in visual_sigma_keys and theta_key(theta) in visual_theta_keys:
                     case = {
                         "sigma": sigma,
                         "theta": theta,
-                        "renderer": renderer_norm,
-                        "mc": mc_norm,
+                        "renderer": renderer_image,
+                        "raytrace": raytrace_image,
                         "diff": diff,
-                        "renderer_crop": crop_centered(renderer_norm, center_x, center_y, args.crop_size),
-                        "mc_crop": crop_centered(mc_norm, center_x, center_y, args.crop_size),
+                        "renderer_crop": crop_centered(renderer_image, center_x, center_y, args.crop_size),
+                        "raytrace_crop": crop_centered(raytrace_image, center_x, center_y, args.crop_size),
                         "diff_crop": crop_centered(diff, center_x, center_y, args.crop_size),
                     }
                     cases.append(case)
@@ -320,7 +309,7 @@ def main():
                         {
                             "sigma": sigma,
                             "theta_deg": theta,
-                            "l1_center_normalized": l1,
+                            "l1": l1,
                         }
                     )
 
@@ -328,12 +317,12 @@ def main():
                     {
                         "sigma": sigma,
                         "theta_deg": theta,
-                        "mse_center_normalized": float(np.mean(diff * diff)),
-                        "mae_center_normalized": l1,
+                        "mse": float(np.mean(diff * diff)),
+                        "mae": l1,
                         "renderer_peak": float(rendered["image"].max().detach().cpu()),
-                        "mc_peak_probability": float(mc.max().detach().cpu()),
+                        "raytrace_peak": float(raytrace.max().detach().cpu()),
                         "renderer_center_intensity": float(renderer_center.detach().cpu()),
-                        "mc_center_probability": float(mc_center.detach().cpu()),
+                        "raytrace_center_intensity": float(raytrace_center.detach().cpu()),
                         "renderer_radius_px": int(rendered["radii"][0].detach().cpu()),
                         "renderer_lat_rad": float(rendered["lat"][0].detach().cpu()),
                         "renderer_lon_rad": float(rendered["lon"][0].detach().cpu()),
@@ -351,7 +340,7 @@ def main():
     np.savez_compressed(
         args.out_dir / "comparison_maps.npz",
         renderer=np.stack([c["renderer"] for c in cases]),
-        mc=np.stack([c["mc"] for c in cases]),
+        raytrace=np.stack([c["raytrace"] for c in cases]),
         diff=np.stack([c["diff"] for c in cases]),
         sigmas=np.asarray([c["sigma"] for c in cases], dtype=np.float32),
         thetas=np.asarray([c["theta"] for c in cases], dtype=np.float32),
