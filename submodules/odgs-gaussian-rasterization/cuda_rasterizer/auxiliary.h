@@ -16,6 +16,10 @@
 #include "stdio.h"
 #include <math.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 #define NUM_WARPS (BLOCK_SIZE/32)
 
@@ -365,6 +369,151 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 		min(grid.x, max((int)0, (int)((p.x + max_radius + BLOCK_X - 1) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
 	};
+}
+
+struct OmniTileBounds
+{
+	uint2 rect_min0;
+	uint2 rect_max0;
+	uint2 rect_min1;
+	uint2 rect_max1;
+	int rect_count;
+};
+
+__forceinline__ __device__ void clearOmniTileBounds(OmniTileBounds& bounds)
+{
+	bounds.rect_min0 = { 0, 0 };
+	bounds.rect_max0 = { 0, 0 };
+	bounds.rect_min1 = { 0, 0 };
+	bounds.rect_max1 = { 0, 0 };
+	bounds.rect_count = 0;
+}
+
+__forceinline__ __device__ void getRectFromPixelBounds(
+	const float x_min,
+	const float x_max,
+	const float y_min,
+	const float y_max,
+	uint2& rect_min,
+	uint2& rect_max,
+	dim3 grid)
+{
+	rect_min = { 0, 0 };
+	rect_max = { 0, 0 };
+	if (!isFinite(x_min) || !isFinite(x_max) || !isFinite(y_min) || !isFinite(y_max) ||
+		x_max < x_min || y_max < y_min)
+		return;
+
+	const int min_px_x = max(0, (int)floorf(x_min));
+	const int min_px_y = max(0, (int)floorf(y_min));
+	const int max_px_x = max(0, (int)ceilf(x_max));
+	const int max_px_y = max(0, (int)ceilf(y_max));
+
+	rect_min = {
+		min(grid.x, (uint32_t)(min_px_x / BLOCK_X)),
+		min(grid.y, (uint32_t)(min_px_y / BLOCK_Y))
+	};
+	rect_max = {
+		min(grid.x, (uint32_t)(max_px_x / BLOCK_X + 1)),
+		min(grid.y, (uint32_t)(max_px_y / BLOCK_Y + 1))
+	};
+}
+
+__forceinline__ __device__ OmniTileBounds getOmniLogMapTileBounds(
+	const float2 p,
+	const int max_radius,
+	const int W,
+	const int H,
+	dim3 grid)
+{
+	OmniTileBounds bounds;
+	clearOmniTileBounds(bounds);
+	if (max_radius <= 0 || W <= 0 || H <= 0 || !isFinite(p))
+		return bounds;
+
+	const float pi = 3.14159265358979323846f;
+	const float two_pi = 6.28318530717958647692f;
+	const float Wf = (float)W;
+	const float Hf = (float)H;
+
+	float center_x = fmodf(p.x, Wf);
+	if (center_x < 0.0f)
+		center_x += Wf;
+	const float theta0 = (0.5f - p.y / Hf) * pi;
+	const float cos_theta0 = cosf(theta0);
+
+	// The render kernel evaluates the Gaussian in log-map tangent coordinates.
+	// Use a spherical cap that conservatively contains the tangent-pixel radius.
+	const float tangent_x_scale = two_pi / Wf * fabsf(cos_theta0);
+	const float tangent_y_scale = pi / Hf;
+	const float gamma_max = (float)max_radius * fmaxf(tangent_x_scale, tangent_y_scale);
+
+	if (!isFinite(center_x) || !isFinite(theta0) || !isFinite(cos_theta0) || !isFinite(gamma_max))
+	{
+		getRect(p, max_radius, bounds.rect_min0, bounds.rect_max0, grid);
+		bounds.rect_count = ((bounds.rect_max0.x - bounds.rect_min0.x) * (bounds.rect_max0.y - bounds.rect_min0.y)) > 0 ? 1 : 0;
+		return bounds;
+	}
+
+	if (fabsf(cos_theta0) < 1.0e-4f)
+	{
+		getRect(p, max_radius, bounds.rect_min0, bounds.rect_max0, grid);
+		bounds.rect_count = ((bounds.rect_max0.x - bounds.rect_min0.x) * (bounds.rect_max0.y - bounds.rect_min0.y)) > 0 ? 1 : 0;
+		return bounds;
+	}
+
+	const float theta_min = clampf(theta0 - gamma_max, -0.5f * pi, 0.5f * pi);
+	const float theta_max = clampf(theta0 + gamma_max, -0.5f * pi, 0.5f * pi);
+	const float y_min = (0.5f - theta_max / pi) * Hf;
+	const float y_max = (0.5f - theta_min / pi) * Hf;
+
+	const bool reaches_pole = fabsf(theta0) + gamma_max >= 0.5f * pi;
+	float lon_delta = pi;
+	if (!reaches_pole)
+	{
+		const float denom = fmaxf(fabsf(cos_theta0), 1.0e-6f);
+		lon_delta = asinf(clampf(sinf(gamma_max) / denom, -1.0f, 1.0f));
+	}
+
+	const float x_delta = lon_delta * Wf / two_pi;
+	if (!isFinite(lon_delta) || reaches_pole || x_delta >= 0.5f * Wf)
+	{
+		getRectFromPixelBounds(0.0f, Wf - 1.0f, y_min, y_max, bounds.rect_min0, bounds.rect_max0, grid);
+		bounds.rect_count = ((bounds.rect_max0.x - bounds.rect_min0.x) * (bounds.rect_max0.y - bounds.rect_min0.y)) > 0 ? 1 : 0;
+		return bounds;
+	}
+
+	const float x_min = center_x - x_delta;
+	const float x_max = center_x + x_delta;
+	if (x_min < 0.0f)
+	{
+		getRectFromPixelBounds(x_min + Wf, Wf - 1.0f, y_min, y_max, bounds.rect_min0, bounds.rect_max0, grid);
+		getRectFromPixelBounds(0.0f, x_max, y_min, y_max, bounds.rect_min1, bounds.rect_max1, grid);
+		bounds.rect_count = 2;
+	}
+	else if (x_max >= Wf)
+	{
+		getRectFromPixelBounds(x_min, Wf - 1.0f, y_min, y_max, bounds.rect_min0, bounds.rect_max0, grid);
+		getRectFromPixelBounds(0.0f, x_max - Wf, y_min, y_max, bounds.rect_min1, bounds.rect_max1, grid);
+		bounds.rect_count = 2;
+	}
+	else
+	{
+		getRectFromPixelBounds(x_min, x_max, y_min, y_max, bounds.rect_min0, bounds.rect_max0, grid);
+		bounds.rect_count = ((bounds.rect_max0.x - bounds.rect_min0.x) * (bounds.rect_max0.y - bounds.rect_min0.y)) > 0 ? 1 : 0;
+	}
+
+	return bounds;
+}
+
+__forceinline__ __device__ uint32_t getOmniTileBoundsTileCount(const OmniTileBounds bounds)
+{
+	uint32_t count = 0;
+	if (bounds.rect_count > 0)
+		count += (bounds.rect_max0.y - bounds.rect_min0.y) * (bounds.rect_max0.x - bounds.rect_min0.x);
+	if (bounds.rect_count > 1)
+		count += (bounds.rect_max1.y - bounds.rect_min1.y) * (bounds.rect_max1.x - bounds.rect_min1.x);
+	return count;
 }
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)

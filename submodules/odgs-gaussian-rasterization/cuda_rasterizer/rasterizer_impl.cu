@@ -74,6 +74,8 @@ __global__ void duplicateWithKeys(
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
+	int W,
+	int H,
 	dim3 grid)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -85,25 +87,29 @@ __global__ void duplicateWithKeys(
 	{
 		// Find this Gaussian's offset in buffer for writing keys/values.
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
-		uint2 rect_min, rect_max;
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+		OmniTileBounds tile_bounds = getOmniLogMapTileBounds(points_xy[idx], radii[idx], W, H, grid);
 
 		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,
 		// and the value is the ID of the Gaussian. Sorting the values 
 		// with this key yields Gaussian IDs in a list, such that they
 		// are first sorted by tile and then by depth. 
-		for (int y = rect_min.y; y < rect_max.y; y++)
+		for (int rect_idx = 0; rect_idx < tile_bounds.rect_count; rect_idx++)
 		{
-			for (int x = rect_min.x; x < rect_max.x; x++)
+			const uint2 rect_min = rect_idx == 0 ? tile_bounds.rect_min0 : tile_bounds.rect_min1;
+			const uint2 rect_max = rect_idx == 0 ? tile_bounds.rect_max0 : tile_bounds.rect_max1;
+			for (int y = rect_min.y; y < rect_max.y; y++)
 			{
-				uint64_t key = y * grid.x + x;
-				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
-				gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx;
-				off++;
+				for (int x = rect_min.x; x < rect_max.x; x++)
+				{
+					uint64_t key = y * grid.x + x;
+					key <<= 32;
+					key |= *((uint32_t*)&depths[idx]);
+					gaussian_keys_unsorted[off] = key;
+					gaussian_values_unsorted[off] = idx;
+					off++;
+				}
 			}
 		}
 	}
@@ -309,6 +315,8 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
+		width,
+		height,
 		tile_grid)
 	CHECK_CUDA(, debug)
 

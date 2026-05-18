@@ -233,12 +233,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	int my_radius = (int)ceil(3.f * sqrt(max(lambda1, lambda2)));
 	float my_psi = 0.5f * atan2(2*cov.y, cov.x - cov.z);
 	
-	uint2 rect_min, rect_max;
-	getRect(point_image, my_radius, rect_min, rect_max, grid);
-	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+	OmniTileBounds tile_bounds = getOmniLogMapTileBounds(point_image, my_radius, W, H, grid);
+	const uint32_t tile_count = getOmniTileBoundsTileCount(tile_bounds);
+	if (tile_count == 0)
 		return;
 
 	// If colors have been precomputed, use them, otherwise convert
@@ -261,7 +261,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+	tiles_touched[idx] = tile_count;
 }
 
 // Main rasterization method. Collaboratively works on one tile per
