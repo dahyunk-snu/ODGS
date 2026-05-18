@@ -55,6 +55,25 @@ struct OmniLogMapBaseResult
 	bool fallback;
 };
 
+struct OmniLogMapPixelContext
+{
+	float2 pix;
+	float3 u;
+	bool valid;
+};
+
+struct OmniLogMapMeanContext
+{
+	float2 mean;
+	float lambda0;
+	float theta0;
+	float sin_theta0;
+	float cos_theta0;
+	float sin_lambda0;
+	float cos_lambda0;
+	bool valid;
+};
+
 __forceinline__ __device__ float clampf(float v, float lo, float hi)
 {
 	return fminf(hi, fmaxf(lo, v));
@@ -100,11 +119,9 @@ __forceinline__ __device__ float2 omniPixelDeltaFallback(const float2 pix, const
 	return { pix.x - mean.x, pix.y - mean.y };
 }
 
-__forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
+__forceinline__ __device__ OmniLogMapBaseResult makeOmniLogMapBaseFallback(
 	const float2 pix,
-	const float2 mean,
-	const int W,
-	const int H)
+	const float2 mean)
 {
 	OmniLogMapBaseResult result;
 	result.d = omniPixelDeltaFallback(pix, mean);
@@ -125,8 +142,156 @@ __forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
 	result.e_lambda = { 1.0f, 0.0f, 0.0f };
 	result.e_theta = { 0.0f, -1.0f, 0.0f };
 	result.fallback = true;
+	return result;
+}
 
-	if (W <= 0 || H <= 0 || !isFinite(pix) || !isFinite(mean))
+__forceinline__ __device__ OmniLogMapPixelContext makeOmniLogMapPixelContext(
+	const float2 pix,
+	const int W,
+	const int H)
+{
+	OmniLogMapPixelContext ctx;
+	ctx.pix = pix;
+	ctx.u = { 0.0f, 0.0f, 1.0f };
+	ctx.valid = false;
+
+	if (W <= 0 || H <= 0 || !isFinite(pix))
+		return ctx;
+
+	const float pi = 3.14159265358979323846f;
+	const float two_pi = 6.28318530717958647692f;
+	const float Wf = (float)W;
+	const float Hf = (float)H;
+	const float lambda = (pix.x / Wf - 0.5f) * two_pi;
+	const float theta = (0.5f - pix.y / Hf) * pi;
+	float sin_lambda, cos_lambda, sin_theta, cos_theta;
+	sincosf(lambda, &sin_lambda, &cos_lambda);
+	sincosf(theta, &sin_theta, &cos_theta);
+
+	if (!isFinite(lambda) || !isFinite(theta) ||
+		!isFinite(sin_lambda) || !isFinite(cos_lambda) ||
+		!isFinite(sin_theta) || !isFinite(cos_theta))
+		return ctx;
+
+	ctx.u = {
+		cos_theta * sin_lambda,
+		-sin_theta,
+		cos_theta * cos_lambda
+	};
+	ctx.valid = true;
+	return ctx;
+}
+
+__forceinline__ __device__ OmniLogMapMeanContext makeOmniLogMapMeanContext(
+	const float2 mean,
+	const int W,
+	const int H)
+{
+	OmniLogMapMeanContext ctx;
+	ctx.mean = mean;
+	ctx.lambda0 = 0.0f;
+	ctx.theta0 = 0.0f;
+	ctx.sin_theta0 = 0.0f;
+	ctx.cos_theta0 = 0.0f;
+	ctx.sin_lambda0 = 0.0f;
+	ctx.cos_lambda0 = 0.0f;
+	ctx.valid = false;
+
+	if (W <= 0 || H <= 0 || !isFinite(mean))
+		return ctx;
+
+	const float pi = 3.14159265358979323846f;
+	const float two_pi = 6.28318530717958647692f;
+	const float Wf = (float)W;
+	const float Hf = (float)H;
+	const float lambda0 = (mean.x / Wf - 0.5f) * two_pi;
+	const float theta0 = (0.5f - mean.y / Hf) * pi;
+	float sin_lambda0, cos_lambda0, sin_theta0, cos_theta0;
+	sincosf(lambda0, &sin_lambda0, &cos_lambda0);
+	sincosf(theta0, &sin_theta0, &cos_theta0);
+
+	if (!isFinite(lambda0) || !isFinite(theta0) ||
+		!isFinite(sin_lambda0) || !isFinite(cos_lambda0) ||
+		!isFinite(sin_theta0) || !isFinite(cos_theta0) ||
+		fabsf(cos_theta0) < 1.0e-4f)
+		return ctx;
+
+	ctx.lambda0 = lambda0;
+	ctx.theta0 = theta0;
+	ctx.sin_theta0 = sin_theta0;
+	ctx.cos_theta0 = cos_theta0;
+	ctx.sin_lambda0 = sin_lambda0;
+	ctx.cos_lambda0 = cos_lambda0;
+	ctx.valid = true;
+	return ctx;
+}
+
+__forceinline__ __device__ float2 logMapOmniDeltaPixel(
+	const OmniLogMapPixelContext& pix_ctx,
+	const OmniLogMapMeanContext& mean_ctx,
+	const int W,
+	const int H)
+{
+	const float2 fallback = omniPixelDeltaFallback(pix_ctx.pix, mean_ctx.mean);
+	if (W <= 0 || H <= 0 || !pix_ctx.valid || !mean_ctx.valid)
+		return fallback;
+
+	const float pi = 3.14159265358979323846f;
+	const float two_pi = 6.28318530717958647692f;
+	const float Wf = (float)W;
+	const float Hf = (float)H;
+
+	const float3 u0 = {
+		mean_ctx.cos_theta0 * mean_ctx.sin_lambda0,
+		-mean_ctx.sin_theta0,
+		mean_ctx.cos_theta0 * mean_ctx.cos_lambda0
+	};
+	const float3 e_lambda = {
+		mean_ctx.cos_lambda0,
+		0.0f,
+		-mean_ctx.sin_lambda0
+	};
+	const float3 e_theta = {
+		-mean_ctx.sin_theta0 * mean_ctx.sin_lambda0,
+		-mean_ctx.cos_theta0,
+		-mean_ctx.sin_theta0 * mean_ctx.cos_lambda0
+	};
+
+	const float q = dot3(pix_ctx.u, u0);
+	if (!isFinite(q))
+		return fallback;
+
+	const float q_clamped = clampf(q, -1.0f, 1.0f);
+	const float gamma = acosf(q_clamped);
+	const float sin_gamma = sinf(gamma);
+	if (!isFinite(gamma) || !isFinite(sin_gamma) ||
+		gamma < 1.0e-6f || fabsf(sin_gamma) < 1.0e-6f)
+		return fallback;
+
+	const float gamma2 = gamma * gamma;
+	const float alpha = (gamma < 1.0e-4f) ? (1.0f + gamma2 / 6.0f) : (gamma / sin_gamma);
+	const float3 w = sub3(pix_ctx.u, mul3(u0, q_clamped));
+	const float3 v = mul3(w, alpha);
+	const float xi = dot3(v, e_lambda);
+	const float eta = dot3(v, e_theta);
+	const float2 d = {
+		(xi / mean_ctx.cos_theta0) * Wf / two_pi,
+		-eta * Hf / pi
+	};
+
+	if (!isFinite(alpha) || !isFinite(w) || !isFinite(v) || !isFinite(d))
+		return fallback;
+	return d;
+}
+
+__forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
+	const OmniLogMapPixelContext& pix_ctx,
+	const OmniLogMapMeanContext& mean_ctx,
+	const int W,
+	const int H)
+{
+	OmniLogMapBaseResult result = makeOmniLogMapBaseFallback(pix_ctx.pix, mean_ctx.mean);
+	if (W <= 0 || H <= 0 || !pix_ctx.valid || !mean_ctx.valid)
 		return result;
 
 	const float pi = 3.14159265358979323846f;
@@ -134,48 +299,23 @@ __forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
 	const float Wf = (float)W;
 	const float Hf = (float)H;
 
-	const float lambda = (pix.x / Wf - 0.5f) * two_pi;
-	const float theta = (0.5f - pix.y / Hf) * pi;
-	const float lambda0 = (mean.x / Wf - 0.5f) * two_pi;
-	const float theta0 = (0.5f - mean.y / Hf) * pi;
-
-	const float sin_lambda = sinf(lambda);
-	const float cos_lambda = cosf(lambda);
-	const float sin_theta = sinf(theta);
-	const float cos_theta = cosf(theta);
-	const float sin_lambda0 = sinf(lambda0);
-	const float cos_lambda0 = cosf(lambda0);
-	const float sin_theta0 = sinf(theta0);
-	const float cos_theta0 = cosf(theta0);
-
-	if (!isFinite(lambda) || !isFinite(theta) || !isFinite(lambda0) || !isFinite(theta0) ||
-		!isFinite(sin_lambda) || !isFinite(cos_lambda) || !isFinite(sin_theta) || !isFinite(cos_theta) ||
-		!isFinite(sin_lambda0) || !isFinite(cos_lambda0) || !isFinite(sin_theta0) || !isFinite(cos_theta0) ||
-		fabsf(cos_theta0) < 1.0e-4f)
-		return result;
-
-	const float3 u = {
-		cos_theta * sin_lambda,
-		-sin_theta,
-		cos_theta * cos_lambda
-	};
 	const float3 u0 = {
-		cos_theta0 * sin_lambda0,
-		-sin_theta0,
-		cos_theta0 * cos_lambda0
+		mean_ctx.cos_theta0 * mean_ctx.sin_lambda0,
+		-mean_ctx.sin_theta0,
+		mean_ctx.cos_theta0 * mean_ctx.cos_lambda0
 	};
 	const float3 e_lambda = {
-		cos_lambda0,
+		mean_ctx.cos_lambda0,
 		0.0f,
-		-sin_lambda0
+		-mean_ctx.sin_lambda0
 	};
 	const float3 e_theta = {
-		-sin_theta0 * sin_lambda0,
-		-cos_theta0,
-		-sin_theta0 * cos_lambda0
+		-mean_ctx.sin_theta0 * mean_ctx.sin_lambda0,
+		-mean_ctx.cos_theta0,
+		-mean_ctx.sin_theta0 * mean_ctx.cos_lambda0
 	};
 
-	const float q = dot3(u, u0);
+	const float q = dot3(pix_ctx.u, u0);
 	if (!isFinite(q))
 		return result;
 
@@ -187,23 +327,14 @@ __forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
 		gamma < 1.0e-6f || fabsf(sin_gamma) < 1.0e-6f)
 		return result;
 
-	float alpha = 0.0f;
-	if (gamma < 1.0e-4f)
-	{
-		const float gamma2 = gamma * gamma;
-		alpha = 1.0f + gamma2 / 6.0f;
-	}
-	else
-	{
-		alpha = gamma / sin_gamma;
-	}
-
-	const float3 w = sub3(u, mul3(u0, q_clamped));
+	const float gamma2 = gamma * gamma;
+	const float alpha = (gamma < 1.0e-4f) ? (1.0f + gamma2 / 6.0f) : (gamma / sin_gamma);
+	const float3 w = sub3(pix_ctx.u, mul3(u0, q_clamped));
 	const float3 v = mul3(w, alpha);
 	const float xi = dot3(v, e_lambda);
 	const float eta = dot3(v, e_theta);
 	const float2 d = {
-		(xi / cos_theta0) * Wf / two_pi,
+		(xi / mean_ctx.cos_theta0) * Wf / two_pi,
 		-eta * Hf / pi
 	};
 
@@ -211,17 +342,17 @@ __forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
 		return result;
 
 	result.d = d;
-	result.lambda0 = lambda0;
-	result.theta0 = theta0;
-	result.sin_theta0 = sin_theta0;
-	result.cos_theta0 = cos_theta0;
-	result.sin_lambda0 = sin_lambda0;
-	result.cos_lambda0 = cos_lambda0;
+	result.lambda0 = mean_ctx.lambda0;
+	result.theta0 = mean_ctx.theta0;
+	result.sin_theta0 = mean_ctx.sin_theta0;
+	result.cos_theta0 = mean_ctx.cos_theta0;
+	result.sin_lambda0 = mean_ctx.sin_lambda0;
+	result.cos_lambda0 = mean_ctx.cos_lambda0;
 	result.q = q_clamped;
 	result.gamma = gamma;
 	result.sin_gamma = sin_gamma;
 	result.alpha = alpha;
-	result.u = u;
+	result.u = pix_ctx.u;
 	result.u0 = u0;
 	result.w = w;
 	result.v = v;
@@ -231,23 +362,34 @@ __forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
 	return result;
 }
 
+__forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
+	const float2 pix,
+	const float2 mean,
+	const int W,
+	const int H)
+{
+	const OmniLogMapPixelContext pix_ctx = makeOmniLogMapPixelContext(pix, W, H);
+	const OmniLogMapMeanContext mean_ctx = makeOmniLogMapMeanContext(mean, W, H);
+	return computeOmniLogMapBase(pix_ctx, mean_ctx, W, H);
+}
+
 __forceinline__ __device__ float2 logMapOmniDeltaPixel(
 	const float2 pix,
 	const float2 mean,
 	const int W,
 	const int H)
 {
-	return computeOmniLogMapBase(pix, mean, W, H).d;
+	const OmniLogMapPixelContext pix_ctx = makeOmniLogMapPixelContext(pix, W, H);
+	const OmniLogMapMeanContext mean_ctx = makeOmniLogMapMeanContext(mean, W, H);
+	return logMapOmniDeltaPixel(pix_ctx, mean_ctx, W, H);
 }
 
 __forceinline__ __device__ OmniLogMapDeltaResult logMapOmniDeltaPixelWithMeanJacobian(
-	const float2 pix,
-	const float2 mean,
+	const OmniLogMapBaseResult& base,
 	const int W,
 	const int H)
 {
 	OmniLogMapDeltaResult result;
-	const OmniLogMapBaseResult base = computeOmniLogMapBase(pix, mean, W, H);
 	result.d = base.d;
 	result.ddx_dmx = -1.0f;
 	result.ddx_dmy = 0.0f;
@@ -332,6 +474,26 @@ __forceinline__ __device__ OmniLogMapDeltaResult logMapOmniDeltaPixelWithMeanJac
 
 	result.fallback = false;
 	return result;
+}
+
+__forceinline__ __device__ OmniLogMapDeltaResult logMapOmniDeltaPixelWithMeanJacobian(
+	const OmniLogMapPixelContext& pix_ctx,
+	const OmniLogMapMeanContext& mean_ctx,
+	const int W,
+	const int H)
+{
+	const OmniLogMapBaseResult base = computeOmniLogMapBase(pix_ctx, mean_ctx, W, H);
+	return logMapOmniDeltaPixelWithMeanJacobian(base, W, H);
+}
+
+__forceinline__ __device__ OmniLogMapDeltaResult logMapOmniDeltaPixelWithMeanJacobian(
+	const float2 pix,
+	const float2 mean,
+	const int W,
+	const int H)
+{
+	const OmniLogMapBaseResult base = computeOmniLogMapBase(pix, mean, W, H);
+	return logMapOmniDeltaPixelWithMeanJacobian(base, W, H);
 }
 
 // Spherical harmonics coefficients
