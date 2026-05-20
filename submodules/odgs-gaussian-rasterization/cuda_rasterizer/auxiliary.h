@@ -114,17 +114,32 @@ __forceinline__ __device__ float3 mul3(const float3 a, const float s)
 	return { a.x * s, a.y * s, a.z * s };
 }
 
-__forceinline__ __device__ float2 omniPixelDeltaFallback(const float2 pix, const float2 mean)
+__forceinline__ __device__ float omniPeriodicPixelDeltaX(const float pix_x, const float mean_x, const int W)
 {
-	return { pix.x - mean.x, pix.y - mean.y };
+	float dx = pix_x - mean_x;
+	if (W > 0 && isFinite(dx))
+	{
+		const float Wf = (float)W;
+		dx = fmodf(dx + 0.5f * Wf, Wf);
+		if (dx < 0.0f)
+			dx += Wf;
+		dx -= 0.5f * Wf;
+	}
+	return dx;
+}
+
+__forceinline__ __device__ float2 omniPixelDeltaFallback(const float2 pix, const float2 mean, const int W)
+{
+	return { omniPeriodicPixelDeltaX(pix.x, mean.x, W), pix.y - mean.y };
 }
 
 __forceinline__ __device__ OmniLogMapBaseResult makeOmniLogMapBaseFallback(
 	const float2 pix,
-	const float2 mean)
+	const float2 mean,
+	const int W)
 {
 	OmniLogMapBaseResult result;
-	result.d = omniPixelDeltaFallback(pix, mean);
+	result.d = omniPixelDeltaFallback(pix, mean, W);
 	result.lambda0 = 0.0f;
 	result.theta0 = 0.0f;
 	result.sin_theta0 = 0.0f;
@@ -232,7 +247,7 @@ __forceinline__ __device__ float2 logMapOmniDeltaPixel(
 	const int W,
 	const int H)
 {
-	const float2 fallback = omniPixelDeltaFallback(pix_ctx.pix, mean_ctx.mean);
+	const float2 fallback = omniPixelDeltaFallback(pix_ctx.pix, mean_ctx.mean, W);
 	if (W <= 0 || H <= 0 || !pix_ctx.valid || !mean_ctx.valid)
 		return fallback;
 
@@ -290,7 +305,7 @@ __forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
 	const int W,
 	const int H)
 {
-	OmniLogMapBaseResult result = makeOmniLogMapBaseFallback(pix_ctx.pix, mean_ctx.mean);
+	OmniLogMapBaseResult result = makeOmniLogMapBaseFallback(pix_ctx.pix, mean_ctx.mean, W);
 	if (W <= 0 || H <= 0 || !pix_ctx.valid || !mean_ctx.valid)
 		return result;
 
@@ -612,14 +627,14 @@ __forceinline__ __device__ OmniTileBounds getOmniLogMapTileBounds(
 
 	if (!isFinite(center_x) || !isFinite(theta0) || !isFinite(cos_theta0) || !isFinite(gamma_max))
 	{
-		getRect(p, max_radius, bounds.rect_min0, bounds.rect_max0, grid);
+		getRectFromPixelBounds(0.0f, Wf - 1.0f, p.y - max_radius, p.y + max_radius, bounds.rect_min0, bounds.rect_max0, grid);
 		bounds.rect_count = ((bounds.rect_max0.x - bounds.rect_min0.x) * (bounds.rect_max0.y - bounds.rect_min0.y)) > 0 ? 1 : 0;
 		return bounds;
 	}
 
 	if (fabsf(cos_theta0) < 1.0e-4f)
 	{
-		getRect(p, max_radius, bounds.rect_min0, bounds.rect_max0, grid);
+		getRectFromPixelBounds(0.0f, Wf - 1.0f, p.y - max_radius, p.y + max_radius, bounds.rect_min0, bounds.rect_max0, grid);
 		bounds.rect_count = ((bounds.rect_max0.x - bounds.rect_min0.x) * (bounds.rect_max0.y - bounds.rect_min0.y)) > 0 ? 1 : 0;
 		return bounds;
 	}
