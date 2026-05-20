@@ -168,8 +168,10 @@ __global__ void computeOmniCov2D(int P,
 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
 	float3 t = transformPoint4x3(mean, viewmatrix);
 
-	float dist = sqrt(t.x*t.x + t.y*t.y + t.z*t.z)+e;
-	float dist_xz = sqrt(t.x*t.x + t.z*t.z)+e;
+	float dist_raw = sqrt(t.x*t.x + t.y*t.y + t.z*t.z);
+	float dist_xz_raw = sqrt(t.x*t.x + t.z*t.z);
+	float dist = dist_raw + e;
+	float dist_xz = dist_xz_raw + e;
 	float lat = atan2(-t.y, dist_xz);   
 	float lon = atan2(t.x, t.z);
 	
@@ -217,18 +219,21 @@ __global__ void computeOmniCov2D(int P,
 		dL_dc = denom2inv * (-a * a * dL_dconic.z + 2 * a * b * dL_dconic.y + (denom - a * c) * dL_dconic.x);
 		dL_db = denom2inv * 2 * (b * c * dL_dconic.x - (denom + 2 * b * b) * dL_dconic.y + a * b * dL_dconic.z);
 
-		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
+		glm::vec3 j0 = J_o[0];
+		glm::vec3 j1 = J_o[1];
+
+		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry,
 		// given gradients w.r.t. 2D covariance matrix (diagonal).
-		dL_dcov[6 * idx + 0] = (T[0][0] * T[0][0] * dL_da + T[0][0] * T[1][0] * dL_db + T[1][0] * T[1][0] * dL_dc);
-		dL_dcov[6 * idx + 3] = (T[0][1] * T[0][1] * dL_da + T[0][1] * T[1][1] * dL_db + T[1][1] * T[1][1] * dL_dc);
-		dL_dcov[6 * idx + 5] = (T[0][2] * T[0][2] * dL_da + T[0][2] * T[1][2] * dL_db + T[1][2] * T[1][2] * dL_dc);
+		dL_dcov[6 * idx + 0] = (j0.x * j0.x * dL_da + j0.x * j1.x * dL_db + j1.x * j1.x * dL_dc);
+		dL_dcov[6 * idx + 3] = (j0.y * j0.y * dL_da + j0.y * j1.y * dL_db + j1.y * j1.y * dL_dc);
+		dL_dcov[6 * idx + 5] = (j0.z * j0.z * dL_da + j0.z * j1.z * dL_db + j1.z * j1.z * dL_dc);
 
 		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
 		// given gradients w.r.t. 2D covariance matrix (off-diagonal).
 		// Off-diagonal elements appear twice --> double the gradient.
-		dL_dcov[6 * idx + 1] = 2 * T[0][0] * T[0][1] * dL_da + (T[0][0] * T[1][1] + T[0][1] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][1] * dL_dc;
-		dL_dcov[6 * idx + 2] = 2 * T[0][0] * T[0][2] * dL_da + (T[0][0] * T[1][2] + T[0][2] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][2] * dL_dc;
-		dL_dcov[6 * idx + 4] = 2 * T[0][2] * T[0][1] * dL_da + (T[0][1] * T[1][2] + T[0][2] * T[1][1]) * dL_db + 2 * T[1][1] * T[1][2] * dL_dc;
+		dL_dcov[6 * idx + 1] = 2 * j0.x * j0.y * dL_da + (j0.x * j1.y + j0.y * j1.x) * dL_db + 2 * j1.x * j1.y * dL_dc;
+		dL_dcov[6 * idx + 2] = 2 * j0.x * j0.z * dL_da + (j0.x * j1.z + j0.z * j1.x) * dL_db + 2 * j1.x * j1.z * dL_dc;
+		dL_dcov[6 * idx + 4] = 2 * j0.y * j0.z * dL_da + (j0.y * j1.z + j0.z * j1.y) * dL_db + 2 * j1.y * j1.z * dL_dc;
 	}
 	else
 	{
@@ -236,40 +241,57 @@ __global__ void computeOmniCov2D(int P,
 			dL_dcov[6 * idx + i] = 0;
 	}
 
-	// Gradients of loss w.r.t. upper 2x3 portion of intermediate matrix T
-	float dL_dT00 = 2 * (T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_da +
-		(T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_db;
-	float dL_dT01 = 2 * (T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_da +
-		(T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_db;
-	float dL_dT02 = 2 * (T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_da +
-		(T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_db;
-	float dL_dT10 = 2 * (T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_dc +
-		(T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_db;
-	float dL_dT11 = 2 * (T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_dc +
-		(T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_db;
-	float dL_dT12 = 2 * (T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_dc +
-		(T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_db;
+	glm::vec3 j0 = J_o[0];
+	glm::vec3 j1 = J_o[1];
+	glm::vec3 dL_dj0 = 2.0f * dL_da * (Vrk * j0) + dL_db * (Vrk * j1);
+	glm::vec3 dL_dj1 = dL_db * (Vrk * j0) + 2.0f * dL_dc * (Vrk * j1);
 
-	// Gradients of loss w.r.t. upper 3x2 non-zero entries of Jacobian matrix
-	float dL_dJ00 = W[0][0] * dL_dT00 + W[0][1] * dL_dT01 + W[0][2] * dL_dT02;
-	float dL_dJ02 = W[2][0] * dL_dT00 + W[2][1] * dL_dT01 + W[2][2] * dL_dT02;
-	float dL_dJ10 = W[0][0] * dL_dT10 + W[0][1] * dL_dT11 + W[0][2] * dL_dT12;
-	float dL_dJ11 = W[1][0] * dL_dT10 + W[1][1] * dL_dT11 + W[1][2] * dL_dT12;
-	float dL_dJ12 = W[2][0] * dL_dT10 + W[2][1] * dL_dT11 + W[2][2] * dL_dT12;
+	glm::mat3 dL_dJ = glm::mat3(0.0f);
+	dL_dJ[0] = dL_dj0;
+	dL_dJ[1] = dL_dj1;
 
-	// Gradients of loss w.r.t. position in camera space
-	float dist2 = dist * dist;
-	float dist4 = dist2 * dist2;
-	float dist_xz2 = dist_xz * dist_xz;
-	float dist_xz3 = dist_xz2 * dist_xz;
-	float dist_xz4 = dist_xz2 * dist_xz2;
+	glm::mat3 dL_dTSQJ = glm::transpose(W) * dL_dJ;
+	glm::vec3 dL_dB0 = dL_dTSQJ[0];
+	glm::vec3 dL_dB1 = dL_dTSQJ[1];
 
-	float denom1 = dist_xz * (dist_xz + e * dist);
-	float denom2 = denom1 * denom1;
+	float sx = SQJ[0][0];
+	float sy = SQJ[1][1];
+	float dL_dsx = glm::dot(dL_dB0, T[0]);
+	float dL_dsy = glm::dot(dL_dB1, T[1]);
+	glm::vec3 dL_dT0 = sx * dL_dB0;
+	glm::vec3 dL_dT1 = sy * dL_dB1;
 
-	float dL_dtx = - x_scale * t.x * t.z * (2 + e*(dist/dist_xz + dist_xz/dist)) / denom2 * dL_dJ00 - x_scale * (denom1 - t.x * t.x * (2 + e*(dist/dist_xz + dist_xz/dist))) / denom2 * dL_dJ02 - y_scale * t.y * (t.z * t.z * dist2 - 2 * t.x * t.x * dist_xz2) / dist4 / dist_xz3 * dL_dJ10 - y_scale * t.x * (dist2 - 2 * t.y * t.y) / dist4 / dist_xz * dL_dJ11 + y_scale * t.x * t.y * t.z * (2*dist_xz2 + dist2) / dist4 / dist_xz3 * dL_dJ12;
-	float dL_dty = - x_scale * t.y * t.z * e * dist_xz / dist / denom2 * dL_dJ00 + x_scale * t.y * t.x * e * dist_xz / dist / denom2 * dL_dJ02 - y_scale * t.x * (dist2 - 2*t.y*t.y) / dist4 / dist_xz * dL_dJ10 - 2 * y_scale * t.y * dist_xz / dist4 * dL_dJ11 - y_scale * t.z * (dist2 - 2*t.y*t.y) / dist4 / dist_xz * dL_dJ12;
-	float dL_dtz = x_scale * (denom1 - t.z * t.z * (2 + e*(dist/dist_xz + dist_xz/dist))) / denom2 * dL_dJ00 + x_scale * t.x * t.z * (2 + e*(dist/dist_xz + dist_xz/dist)) * dL_dJ02 + y_scale * t.x * t.y * t.z * (2*dist_xz2 + dist2) / dist4 / dist_xz3 * dL_dJ10 - y_scale * t.z * (dist2 - 2 * t.y * t.y) / dist4 / dist_xz * dL_dJ11 - y_scale * t.y * (t.x * t.x * dist2 - 2 * t.z * t.z * dist_xz2) / dist4 / dist_xz3 * dL_dJ12;
+	float sin_lon = sin(lon);
+	float cos_lon = cos(lon);
+	float sin_lat = sin(lat);
+	float cos_lat = cos(lat);
+
+	glm::vec3 dT0_dlon = { -sin_lon, 0.0f, -cos_lon };
+	glm::vec3 dT1_dlon = { sin_lat * cos_lon, 0.0f, -sin_lat * sin_lon };
+	glm::vec3 dT1_dlat = { cos_lat * sin_lon, -sin_lat, cos_lat * cos_lon };
+
+	float dL_dlon = glm::dot(dL_dT0, dT0_dlon) + glm::dot(dL_dT1, dT1_dlon);
+	float dL_dlat = glm::dot(dL_dT1, dT1_dlat);
+
+	float cos_lat_eps = cos_lat + e;
+	dL_dlat += dL_dsx * x_scale * sin_lat / (cos_lat_eps * cos_lat_eps * dist);
+	float dL_ddist = dL_dsx * (-x_scale / (cos_lat_eps * dist * dist)) + dL_dsy * (-y_scale / (dist * dist));
+
+	// Gradients of loss w.r.t. position in camera space.
+	float safe_dist_raw = fmaxf(dist_raw, e);
+	float safe_dist_xz_raw = fmaxf(dist_xz_raw, e);
+	float lon_denom = fmaxf(t.x * t.x + t.z * t.z, e);
+	float lat_denom = t.y * t.y + dist_xz * dist_xz;
+
+	float dlon_dtx = t.z / lon_denom;
+	float dlon_dtz = -t.x / lon_denom;
+	float dlat_dtx = t.y * t.x / (safe_dist_xz_raw * lat_denom);
+	float dlat_dty = -dist_xz / lat_denom;
+	float dlat_dtz = t.y * t.z / (safe_dist_xz_raw * lat_denom);
+
+	float dL_dtx = dL_dlon * dlon_dtx + dL_dlat * dlat_dtx + dL_ddist * t.x / safe_dist_raw;
+	float dL_dty = dL_dlat * dlat_dty + dL_ddist * t.y / safe_dist_raw;
+	float dL_dtz = dL_dlon * dlon_dtz + dL_dlat * dlat_dtz + dL_ddist * t.z / safe_dist_raw;
 
 	// Account for transformation of mean to t
 	float3 dL_dmean = transformVec4x3Transpose({ dL_dtx, dL_dty, dL_dtz }, viewmatrix);
