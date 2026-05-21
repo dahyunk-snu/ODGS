@@ -367,7 +367,7 @@ class GaussianModel:
         padded_grad[:grads.shape[0]] = grads.squeeze()
         
         cos_lat = torch.cos(lat)
-        padded_dynamic_grad_threshold = torch.zeros((n_init_points), device="cuda")
+        padded_dynamic_grad_threshold = torch.full((n_init_points,), float("inf"), device="cuda")
         dynamic_grad_threshold = (1-cos_lat) * (grad_threshold_max - grad_threshold_min) + grad_threshold_min
         padded_dynamic_grad_threshold[:grads.shape[0]] = dynamic_grad_threshold.squeeze()
         selected_pts_mask = torch.where(padded_grad >= padded_dynamic_grad_threshold, True, False)

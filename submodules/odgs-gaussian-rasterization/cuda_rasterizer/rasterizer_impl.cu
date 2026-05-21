@@ -68,14 +68,12 @@ __global__ void checkSphereShell(int P,
 // Run once per Gaussian (1:N mapping).
 __global__ void duplicateWithKeys(
 	int P,
-	const float2* points_xy,
+	const OmniTileBounds* tile_bounds,
 	const float* depths,
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
-	int W,
-	int H,
 	dim3 grid)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -87,18 +85,17 @@ __global__ void duplicateWithKeys(
 	{
 		// Find this Gaussian's offset in buffer for writing keys/values.
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
-
-		OmniTileBounds tile_bounds = getOmniLogMapTileBounds(points_xy[idx], radii[idx], W, H, grid);
+		const OmniTileBounds bounds = tile_bounds[idx];
 
 		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,
 		// and the value is the ID of the Gaussian. Sorting the values 
 		// with this key yields Gaussian IDs in a list, such that they
 		// are first sorted by tile and then by depth. 
-		for (int rect_idx = 0; rect_idx < tile_bounds.rect_count; rect_idx++)
+		for (int rect_idx = 0; rect_idx < bounds.rect_count; rect_idx++)
 		{
-			const uint2 rect_min = rect_idx == 0 ? tile_bounds.rect_min0 : tile_bounds.rect_min1;
-			const uint2 rect_max = rect_idx == 0 ? tile_bounds.rect_max0 : tile_bounds.rect_max1;
+			const uint2 rect_min = rect_idx == 0 ? bounds.rect_min0 : bounds.rect_min1;
+			const uint2 rect_max = rect_idx == 0 ? bounds.rect_max0 : bounds.rect_max1;
 			for (int y = rect_min.y; y < rect_max.y; y++)
 			{
 				for (int x = rect_min.x; x < rect_max.x; x++)
@@ -164,6 +161,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.internal_radii, P, 128);
 	obtain(chunk, geom.internal_psi, P, 128);
 	obtain(chunk, geom.means2D, P, 128);
+	obtain(chunk, geom.tile_bounds, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
@@ -284,6 +282,7 @@ int CudaRasterizer::Rasterizer::forward(
 		lat,
 		lon,
 		geomState.means2D,
+		geomState.tile_bounds,
 		geomState.depths,
 		geomState.cov3D,
 		geomState.rgb,
@@ -309,14 +308,12 @@ int CudaRasterizer::Rasterizer::forward(
 	// and corresponding dublicated Gaussian indices to be sorted
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
-		geomState.means2D,
+		geomState.tile_bounds,
 		geomState.depths,
 		geomState.point_offsets,
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
-		width,
-		height,
 		tile_grid)
 	CHECK_CUDA(, debug)
 

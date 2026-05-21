@@ -173,6 +173,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float* lat,
 	float* lon,
 	float2* points_xy_image,
+	OmniTileBounds* stored_tile_bounds,
 	float* depths,
 	float* cov3Ds,
 	float* rgb,
@@ -237,6 +238,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float my_psi = 0.5f * atan2(2*cov.y, cov.x - cov.z);
 	
 	OmniTileBounds tile_bounds = getOmniLogMapTileBounds(point_image, my_radius, W, H, grid);
+	stored_tile_bounds[idx] = tile_bounds;
 	const uint32_t tile_count = getOmniTileBoundsTileCount(tile_bounds);
 	if (tile_count == 0)
 		return;
@@ -442,6 +444,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float* lat,
 	float* lon,
 	float2* means2D,
+	OmniTileBounds* tile_bounds,
 	float* depths,
 	float* cov3Ds,
 	float* rgb,
@@ -469,6 +472,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		lat,
 		lon,
 		means2D,
+		tile_bounds,
 		depths,
 		cov3Ds,
 		rgb,

@@ -16,6 +16,8 @@
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
 
+struct OmniTileBounds;
+
 namespace CudaRasterizer
 {
 	template <typename T>
@@ -37,6 +39,7 @@ namespace CudaRasterizer
 		float* internal_lat;
 		float* internal_lon;
 		float2* means2D;
+		OmniTileBounds* tile_bounds;
 		float* cov3D;
 		float4* conic_opacity;
 		float* rgb;

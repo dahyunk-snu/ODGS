@@ -15,6 +15,7 @@
 #include <cuda.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include "auxiliary.h"
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
 
@@ -39,6 +40,7 @@ namespace FORWARD
 		float* lat,
 		float* lon,
 		float2* points_xy_image,
+		OmniTileBounds* tile_bounds,
 		float* depths,
 		float* cov3Ds,
 		float* colors,
