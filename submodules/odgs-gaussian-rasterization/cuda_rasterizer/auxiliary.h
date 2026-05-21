@@ -71,6 +71,9 @@ struct OmniLogMapMeanContext
 	float cos_theta0;
 	float sin_lambda0;
 	float cos_lambda0;
+	float3 u0;
+	float3 e_lambda;
+	float3 e_theta;
 	bool valid;
 };
 
@@ -210,6 +213,9 @@ __forceinline__ __device__ OmniLogMapMeanContext makeOmniLogMapMeanContext(
 	ctx.cos_theta0 = 0.0f;
 	ctx.sin_lambda0 = 0.0f;
 	ctx.cos_lambda0 = 0.0f;
+	ctx.u0 = { 0.0f, 0.0f, 0.0f };
+	ctx.e_lambda = { 0.0f, 0.0f, 0.0f };
+	ctx.e_theta = { 0.0f, 0.0f, 0.0f };
 	ctx.valid = false;
 
 	if (W <= 0 || H <= 0 || !isFinite(mean))
@@ -237,6 +243,21 @@ __forceinline__ __device__ OmniLogMapMeanContext makeOmniLogMapMeanContext(
 	ctx.cos_theta0 = cos_theta0;
 	ctx.sin_lambda0 = sin_lambda0;
 	ctx.cos_lambda0 = cos_lambda0;
+	ctx.u0 = {
+		cos_theta0 * sin_lambda0,
+		-sin_theta0,
+		cos_theta0 * cos_lambda0
+	};
+	ctx.e_lambda = {
+		cos_lambda0,
+		0.0f,
+		-sin_lambda0
+	};
+	ctx.e_theta = {
+		-sin_theta0 * sin_lambda0,
+		-cos_theta0,
+		-sin_theta0 * cos_lambda0
+	};
 	ctx.valid = true;
 	return ctx;
 }
@@ -256,21 +277,9 @@ __forceinline__ __device__ float2 logMapOmniDeltaPixel(
 	const float Wf = (float)W;
 	const float Hf = (float)H;
 
-	const float3 u0 = {
-		mean_ctx.cos_theta0 * mean_ctx.sin_lambda0,
-		-mean_ctx.sin_theta0,
-		mean_ctx.cos_theta0 * mean_ctx.cos_lambda0
-	};
-	const float3 e_lambda = {
-		mean_ctx.cos_lambda0,
-		0.0f,
-		-mean_ctx.sin_lambda0
-	};
-	const float3 e_theta = {
-		-mean_ctx.sin_theta0 * mean_ctx.sin_lambda0,
-		-mean_ctx.cos_theta0,
-		-mean_ctx.sin_theta0 * mean_ctx.cos_lambda0
-	};
+	const float3 u0 = mean_ctx.u0;
+	const float3 e_lambda = mean_ctx.e_lambda;
+	const float3 e_theta = mean_ctx.e_theta;
 
 	const float q = dot3(pix_ctx.u, u0);
 	if (!isFinite(q))
@@ -314,21 +323,9 @@ __forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
 	const float Wf = (float)W;
 	const float Hf = (float)H;
 
-	const float3 u0 = {
-		mean_ctx.cos_theta0 * mean_ctx.sin_lambda0,
-		-mean_ctx.sin_theta0,
-		mean_ctx.cos_theta0 * mean_ctx.cos_lambda0
-	};
-	const float3 e_lambda = {
-		mean_ctx.cos_lambda0,
-		0.0f,
-		-mean_ctx.sin_lambda0
-	};
-	const float3 e_theta = {
-		-mean_ctx.sin_theta0 * mean_ctx.sin_lambda0,
-		-mean_ctx.cos_theta0,
-		-mean_ctx.sin_theta0 * mean_ctx.cos_lambda0
-	};
+	const float3 u0 = mean_ctx.u0;
+	const float3 e_lambda = mean_ctx.e_lambda;
+	const float3 e_theta = mean_ctx.e_theta;
 
 	const float q = dot3(pix_ctx.u, u0);
 	if (!isFinite(q))
@@ -429,7 +426,8 @@ __forceinline__ __device__ OmniLogMapDeltaResult logMapOmniDeltaPixelWithMeanJac
 	const float q = base.q;
 	const float gamma = base.gamma;
 	const float sin_gamma = base.sin_gamma;
-	const float cos_gamma = cosf(gamma);
+	// cos(gamma) == cos(acos(q)) == q, so reuse base.q instead of a cosf call.
+	const float cos_gamma = q;
 	const float alpha = base.alpha;
 	const float xi = dot3(base.v, base.e_lambda);
 

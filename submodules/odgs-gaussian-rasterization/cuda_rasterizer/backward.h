@@ -18,6 +18,8 @@
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
 
+struct OmniLogMapMeanContext;
+
 namespace BACKWARD
 {
 	void render(const dim3 grid, dim3 block,
@@ -25,7 +27,7 @@ namespace BACKWARD
 		const uint32_t* point_list,
 		int W, int H,
 		const float* bg_color,
-		const float2* means2D,
+		const OmniLogMapMeanContext* omni_mean,
 		const float4* conic_opacity,
 		const float* colors,
 		const float* depths,

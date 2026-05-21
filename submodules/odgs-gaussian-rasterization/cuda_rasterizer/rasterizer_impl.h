@@ -17,6 +17,7 @@
 #include <cuda_runtime_api.h>
 
 struct OmniTileBounds;
+struct OmniLogMapMeanContext;
 
 namespace CudaRasterizer
 {
@@ -38,7 +39,7 @@ namespace CudaRasterizer
 		float* internal_psi;
 		float* internal_lat;
 		float* internal_lon;
-		float2* means2D;
+		OmniLogMapMeanContext* omni_mean;
 		OmniTileBounds* tile_bounds;
 		float* cov3D;
 		float4* conic_opacity;

@@ -439,7 +439,7 @@ renderCUDA(
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
 	const float* __restrict__ bg_color,
-	const float2* __restrict__ points_xy_image,
+	const OmniLogMapMeanContext* __restrict__ omni_mean,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
@@ -518,9 +518,8 @@ renderCUDA(
 		if (range.x + progress < range.y)
 		{
 			const int coll_id = point_list[range.y - progress - 1];
-			const float2 mean_xy = points_xy_image[coll_id];
 			collected_id[block.thread_rank()] = coll_id;
-			collected_omni_mean[block.thread_rank()] = makeOmniLogMapMeanContext(mean_xy, W, H);
+			collected_omni_mean[block.thread_rank()] = omni_mean[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			collected_depths[block.thread_rank()] = depths[coll_id];
 			for (int i = 0; i < C; i++)
@@ -677,7 +676,7 @@ void BACKWARD::render(const dim3 grid, const dim3 block,
 	const uint32_t* point_list,
 	int W, int H,
 	const float* bg_color,
-	const float2* means2D,
+	const OmniLogMapMeanContext* omni_mean,
 	const float4* conic_opacity,
 	const float* colors,
 	const float* depths,
@@ -700,7 +699,7 @@ void BACKWARD::render(const dim3 grid, const dim3 block,
 		point_list,
 		W, H,
 		bg_color,
-		means2D,
+		omni_mean,
 		conic_opacity,
 		colors,
 		depths,

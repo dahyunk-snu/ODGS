@@ -172,7 +172,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float* psi,
 	float* lat,
 	float* lon,
-	float2* points_xy_image,
+	OmniLogMapMeanContext* omni_mean,
 	OmniTileBounds* stored_tile_bounds,
 	float* depths,
 	float* cov3Ds,
@@ -260,7 +260,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Store some useful helper data for the next steps.
 	depths[idx] = dist;
 	radii[idx] = my_radius;
-	points_xy_image[idx] = point_image;
+	omni_mean[idx] = makeOmniLogMapMeanContext(point_image, W, H);
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
 	tiles_touched[idx] = tile_count;
@@ -275,7 +275,7 @@ renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
-	const float2* __restrict__ points_xy_image,
+	const OmniLogMapMeanContext* __restrict__ omni_mean,
 	const float* __restrict__ features,
 	const float* __restrict__ depths,
 	const float4* __restrict__ conic_opacity,
@@ -333,9 +333,8 @@ renderCUDA(
 		if (range.x + progress < range.y)
 		{
 			int coll_id = point_list[range.x + progress];
-			float2 mean_xy = points_xy_image[coll_id];
 			collected_id[block.thread_rank()] = coll_id;
-			collected_omni_mean[block.thread_rank()] = makeOmniLogMapMeanContext(mean_xy, W, H);
+			collected_omni_mean[block.thread_rank()] = omni_mean[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			collected_depth[block.thread_rank()] = depths[coll_id];
 		}
@@ -399,7 +398,7 @@ void FORWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
-	const float2* means2D,
+	const OmniLogMapMeanContext* omni_mean,
 	const float* colors,
 	const float* depths,
 	const float4* conic_opacity,
@@ -414,7 +413,7 @@ void FORWARD::render(
 		ranges,
 		point_list,
 		W, H,
-		means2D,
+		omni_mean,
 		colors,
 		depths,
 		conic_opacity,
@@ -443,7 +442,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float* psi,
 	float* lat,
 	float* lon,
-	float2* means2D,
+	OmniLogMapMeanContext* omni_mean,
 	OmniTileBounds* tile_bounds,
 	float* depths,
 	float* cov3Ds,
@@ -471,7 +470,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		psi,
 		lat,
 		lon,
-		means2D,
+		omni_mean,
 		tile_bounds,
 		depths,
 		cov3Ds,
