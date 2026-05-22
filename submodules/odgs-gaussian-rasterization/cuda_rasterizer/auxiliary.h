@@ -59,6 +59,10 @@ struct OmniLogMapPixelContext
 {
 	float2 pix;
 	float3 u;
+	float sin_lambda;
+	float cos_lambda;
+	float sin_theta;
+	float cos_theta;
 	bool valid;
 };
 
@@ -75,6 +79,23 @@ struct OmniLogMapMeanContext
 	float3 e_lambda;
 	float3 e_theta;
 	bool valid;
+};
+
+// Per-(tile, Gaussian) log-map data. The log-map is evaluated once per tile at
+// the tile anchor pixel; each pixel then reconstructs its own delta with a
+// first-order expansion, instead of paying a full log-map per pixel.
+struct OmniLogMapTileResult
+{
+	float2 d;        // log-map delta at the tile anchor pixel
+	float ddx_dpx;   // d(delta) / d(pixel): in-tile first-order reconstruction
+	float ddx_dpy;
+	float ddy_dpx;
+	float ddy_dpy;
+	float ddx_dmx;   // d(delta) / d(mean pixel): consumed by the backward pass
+	float ddx_dmy;
+	float ddy_dmx;
+	float ddy_dmy;
+	bool fallback;
 };
 
 __forceinline__ __device__ float clampf(float v, float lo, float hi)
@@ -171,6 +192,10 @@ __forceinline__ __device__ OmniLogMapPixelContext makeOmniLogMapPixelContext(
 	OmniLogMapPixelContext ctx;
 	ctx.pix = pix;
 	ctx.u = { 0.0f, 0.0f, 1.0f };
+	ctx.sin_lambda = 0.0f;
+	ctx.cos_lambda = 0.0f;
+	ctx.sin_theta = 0.0f;
+	ctx.cos_theta = 0.0f;
 	ctx.valid = false;
 
 	if (W <= 0 || H <= 0 || !isFinite(pix))
@@ -196,6 +221,10 @@ __forceinline__ __device__ OmniLogMapPixelContext makeOmniLogMapPixelContext(
 		-sin_theta,
 		cos_theta * cos_lambda
 	};
+	ctx.sin_lambda = sin_lambda;
+	ctx.cos_lambda = cos_lambda;
+	ctx.sin_theta = sin_theta;
+	ctx.cos_theta = cos_theta;
 	ctx.valid = true;
 	return ctx;
 }
@@ -507,6 +536,104 @@ __forceinline__ __device__ OmniLogMapDeltaResult logMapOmniDeltaPixelWithMeanJac
 {
 	const OmniLogMapBaseResult base = computeOmniLogMapBase(pix, mean, W, H);
 	return logMapOmniDeltaPixelWithMeanJacobian(base, W, H);
+}
+
+// Evaluate the log-map once at the tile anchor pixel. Returns the anchor delta,
+// the in-tile pixel Jacobian (for first-order per-pixel reconstruction) and the
+// mean Jacobian (for the backward pass). Computing this once per (tile,
+// Gaussian) instead of once per (pixel, Gaussian) amortises the transcendental
+// work over the whole 16x16 tile.
+__forceinline__ __device__ OmniLogMapTileResult computeOmniLogMapTile(
+	const OmniLogMapPixelContext& anchor_ctx,
+	const OmniLogMapMeanContext& mean_ctx,
+	const int W,
+	const int H)
+{
+	const OmniLogMapBaseResult base = computeOmniLogMapBase(anchor_ctx, mean_ctx, W, H);
+	const OmniLogMapDeltaResult mean_jac = logMapOmniDeltaPixelWithMeanJacobian(base, W, H);
+
+	OmniLogMapTileResult result;
+	result.d = base.d;
+	result.ddx_dmx = mean_jac.ddx_dmx;
+	result.ddx_dmy = mean_jac.ddx_dmy;
+	result.ddy_dmx = mean_jac.ddy_dmx;
+	result.ddy_dmy = mean_jac.ddy_dmy;
+	// Fallback delta is the (periodic) pixel-minus-mean offset, which is already
+	// exactly linear in the pixel coordinate -> identity in-tile Jacobian.
+	result.ddx_dpx = 1.0f;
+	result.ddx_dpy = 0.0f;
+	result.ddy_dpx = 0.0f;
+	result.ddy_dpy = 1.0f;
+	result.fallback = base.fallback;
+
+	if (result.fallback)
+		return result;
+
+	const float pi = 3.14159265358979323846f;
+	const float two_pi = 6.28318530717958647692f;
+	const float Wf = (float)W;
+	const float Hf = (float)H;
+	const float pixel_x_scale = Wf / two_pi;
+	const float pixel_y_scale = Hf / pi;
+
+	// d(delta)/d(u), where u is the pixel ray direction. The mean tangent frame
+	// (e_lambda, e_theta, cos_theta0) does not depend on the pixel, so this is
+	// simpler than the mean Jacobian (no frame-derivative terms).
+	const float cos_gamma = base.q;  // cos(acos(q)) == q
+	const float dalpha_dgamma = (base.gamma < 1.0e-4f) ?
+		(base.gamma / 3.0f) :
+		((base.sin_gamma - base.gamma * cos_gamma) / (base.sin_gamma * base.sin_gamma));
+	const float c_alpha = -dalpha_dgamma / base.sin_gamma;
+
+	// e_lambda . u0 == e_theta . u0 == 0, so d(xi)/d(u) and d(eta)/d(u) reduce:
+	const float el_dot_w = dot3(base.e_lambda, base.w);
+	const float et_dot_w = dot3(base.e_theta, base.w);
+	const float3 dxi_du = add3(mul3(base.e_lambda, base.alpha), mul3(base.u0, c_alpha * el_dot_w));
+	const float3 deta_du = add3(mul3(base.e_theta, base.alpha), mul3(base.u0, c_alpha * et_dot_w));
+
+	const float inv_cos_theta0 = 1.0f / base.cos_theta0;
+	const float3 ddx_du = mul3(dxi_du, pixel_x_scale * inv_cos_theta0);
+	const float3 ddy_du = mul3(deta_du, -pixel_y_scale);
+
+	// d(u)/d(pixel) at the anchor pixel.
+	const float ct = anchor_ctx.cos_theta;
+	const float st = anchor_ctx.sin_theta;
+	const float cl = anchor_ctx.cos_lambda;
+	const float sl = anchor_ctx.sin_lambda;
+	const float3 du_dlambda = { ct * cl, 0.0f, -ct * sl };
+	const float3 du_dtheta = { -st * sl, -ct, -st * cl };
+	const float3 du_dpx = mul3(du_dlambda, two_pi / Wf);
+	const float3 du_dpy = mul3(du_dtheta, -pi / Hf);
+
+	const float ddx_dpx = dot3(ddx_du, du_dpx);
+	const float ddx_dpy = dot3(ddx_du, du_dpy);
+	const float ddy_dpx = dot3(ddy_du, du_dpx);
+	const float ddy_dpy = dot3(ddy_du, du_dpy);
+
+	// Keep the identity in-tile Jacobian if anything went non-finite.
+	if (isFinite(ddx_dpx) && isFinite(ddx_dpy) && isFinite(ddy_dpx) && isFinite(ddy_dpy))
+	{
+		result.ddx_dpx = ddx_dpx;
+		result.ddx_dpy = ddx_dpy;
+		result.ddy_dpx = ddy_dpx;
+		result.ddy_dpy = ddy_dpy;
+	}
+	return result;
+}
+
+// First-order reconstruction of the per-pixel log-map delta within a tile,
+// from the anchor delta and the in-tile pixel Jacobian.
+__forceinline__ __device__ float2 applyOmniLogMapTile(
+	const OmniLogMapTileResult& lm,
+	const float2 pix,
+	const float2 anchor)
+{
+	const float dpx = pix.x - anchor.x;
+	const float dpy = pix.y - anchor.y;
+	return {
+		lm.d.x + lm.ddx_dpx * dpx + lm.ddx_dpy * dpy,
+		lm.d.y + lm.ddy_dpx * dpx + lm.ddy_dpy * dpy
+	};
 }
 
 // Spherical harmonics coefficients

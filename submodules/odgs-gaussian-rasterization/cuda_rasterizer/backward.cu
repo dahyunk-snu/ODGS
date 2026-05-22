@@ -465,7 +465,10 @@ renderCUDA(
 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float2 pixf = { (float)pix.x, (float)pix.y };
-	const OmniLogMapPixelContext pix_omni = makeOmniLogMapPixelContext(pixf, W, H);
+	// Tile anchor: must match the forward pass exactly so the reconstructed
+	// delta and its mean Jacobian are consistent with what was rendered.
+	const float2 tile_anchor = { (float)pix_min.x + BLOCK_X * 0.5f, (float)pix_min.y + BLOCK_Y * 0.5f };
+	const OmniLogMapPixelContext anchor_omni = makeOmniLogMapPixelContext(tile_anchor, W, H);
 
 	const bool inside = pix.x < W && pix.y < H;
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -476,7 +479,7 @@ renderCUDA(
 	int toDo = range.y - range.x;
 
 	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ OmniLogMapMeanContext collected_omni_mean[BLOCK_SIZE];
+	__shared__ OmniLogMapTileResult collected_tile_lm[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	__shared__ float collected_depths[BLOCK_SIZE];
@@ -519,7 +522,7 @@ renderCUDA(
 		{
 			const int coll_id = point_list[range.y - progress - 1];
 			collected_id[block.thread_rank()] = coll_id;
-			collected_omni_mean[block.thread_rank()] = omni_mean[coll_id];
+			collected_tile_lm[block.thread_rank()] = computeOmniLogMapTile(anchor_omni, omni_mean[coll_id], W, H);
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			collected_depths[block.thread_rank()] = depths[coll_id];
 			for (int i = 0; i < C; i++)
@@ -537,8 +540,8 @@ renderCUDA(
 				continue;
 
 			// Compute blending values, as before.
-			const OmniLogMapBaseResult lm_base = computeOmniLogMapBase(pix_omni, collected_omni_mean[j], W, H);
-			const float2 d = lm_base.d;
+			const OmniLogMapTileResult lm = collected_tile_lm[j];
+			const float2 d = applyOmniLogMapTile(lm, pixf, tile_anchor);
 			const float4 con_o = collected_conic_opacity[j];
 			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
@@ -548,7 +551,6 @@ renderCUDA(
 			const float alpha = min(0.99f, con_o.w * G);
 			if (alpha < 1.0f / 255.0f)
 				continue;
-			const OmniLogMapDeltaResult lm = logMapOmniDeltaPixelWithMeanJacobian(lm_base, W, H);
 
 			T = T / (1.f - alpha);
 			const float dchannel_dcolor = alpha * T;

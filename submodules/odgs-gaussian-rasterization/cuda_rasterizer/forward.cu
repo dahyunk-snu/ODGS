@@ -294,7 +294,10 @@ renderCUDA(
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x, (float)pix.y };
-	const OmniLogMapPixelContext pix_omni = makeOmniLogMapPixelContext(pixf, W, H);
+	// Tile anchor: the log-map is evaluated once here per Gaussian, then each
+	// pixel reconstructs its own delta with a first-order expansion.
+	const float2 tile_anchor = { (float)pix_min.x + BLOCK_X * 0.5f, (float)pix_min.y + BLOCK_Y * 0.5f };
+	const OmniLogMapPixelContext anchor_omni = makeOmniLogMapPixelContext(tile_anchor, W, H);
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W && pix.y < H;
@@ -308,7 +311,7 @@ renderCUDA(
 
 	// Allocate storage for batches of collectively fetched data.
 	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ OmniLogMapMeanContext collected_omni_mean[BLOCK_SIZE];
+	__shared__ OmniLogMapTileResult collected_tile_lm[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_depth[BLOCK_SIZE];
 
@@ -334,7 +337,7 @@ renderCUDA(
 		{
 			int coll_id = point_list[range.x + progress];
 			collected_id[block.thread_rank()] = coll_id;
-			collected_omni_mean[block.thread_rank()] = omni_mean[coll_id];
+			collected_tile_lm[block.thread_rank()] = computeOmniLogMapTile(anchor_omni, omni_mean[coll_id], W, H);
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			collected_depth[block.thread_rank()] = depths[coll_id];
 		}
@@ -348,7 +351,7 @@ renderCUDA(
 
 			// Resample using conic matrix (cf. "Surface 
 			// Splatting" by Zwicker et al., 2001)
-			float2 d = logMapOmniDeltaPixel(pix_omni, collected_omni_mean[j], W, H);
+			float2 d = applyOmniLogMapTile(collected_tile_lm[j], pixf, tile_anchor);
 			float4 con_o = collected_conic_opacity[j];
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
