@@ -198,6 +198,7 @@ def save_l1_plot(rows, sigmas, out_path):
 
     ax.set_xlabel("theta (deg)")
     ax.set_ylabel("L1 loss")
+    ax.set_ylim(0, 0.042)
     ax.set_title("Renderer vs Ray-traced L1")
     ax.grid(True, alpha=0.3)
     ax.legend()
