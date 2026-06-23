@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -17,7 +17,7 @@
 #include <cuda_runtime_api.h>
 
 struct OmniTileBounds;
-struct OmniLogMapMeanContext;
+struct OmniTangentFrame;
 
 namespace CudaRasterizer
 {
@@ -39,7 +39,7 @@ namespace CudaRasterizer
 		float* internal_psi;
 		float* internal_lat;
 		float* internal_lon;
-		OmniLogMapMeanContext* omni_mean;
+		OmniTangentFrame* tangent_frames;
 		OmniTileBounds* tile_bounds;
 		float* cov3D;
 		float4* conic_opacity;
@@ -71,7 +71,7 @@ namespace CudaRasterizer
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 
-	template<typename T> 
+	template<typename T>
 	size_t required(size_t P)
 	{
 		char* size = nullptr;

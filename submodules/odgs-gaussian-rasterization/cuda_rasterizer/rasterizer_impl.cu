@@ -160,7 +160,9 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.clamped, P * 3, 128);
 	obtain(chunk, geom.internal_radii, P, 128);
 	obtain(chunk, geom.internal_psi, P, 128);
-	obtain(chunk, geom.omni_mean, P, 128);
+	obtain(chunk, geom.internal_lat, P, 128);
+	obtain(chunk, geom.internal_lon, P, 128);
+	obtain(chunk, geom.tangent_frames, P, 128);
 	obtain(chunk, geom.tile_bounds, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
@@ -281,7 +283,7 @@ int CudaRasterizer::Rasterizer::forward(
 		psi,
 		lat,
 		lon,
-		geomState.omni_mean,
+		geomState.tangent_frames,
 		geomState.tile_bounds,
 		geomState.depths,
 		geomState.cov3D,
@@ -344,9 +346,8 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
-		geomState.omni_mean,
+		geomState.tangent_frames,
 		feature_ptr,
-		geomState.depths,
 		geomState.conic_opacity,
 		imgState.accum_alpha,
 		imgState.n_contrib,
@@ -410,7 +411,6 @@ void CudaRasterizer::Rasterizer::backward(
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
-	const float* depth_ptr = geomState.depths;
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,
@@ -418,10 +418,9 @@ void CudaRasterizer::Rasterizer::backward(
 		binningState.point_list,
 		width, height,
 		background,
-		geomState.omni_mean,
+		geomState.tangent_frames,
 		geomState.conic_opacity,
 		color_ptr,
-		depth_ptr,
 		accum_depth,
 		accum_acc,
 		imgState.accum_alpha,

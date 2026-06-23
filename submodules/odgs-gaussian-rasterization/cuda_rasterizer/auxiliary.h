@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -22,81 +22,6 @@
 
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 #define NUM_WARPS (BLOCK_SIZE/32)
-
-struct OmniLogMapDeltaResult
-{
-	float2 d;
-	float ddx_dmx;
-	float ddx_dmy;
-	float ddy_dmx;
-	float ddy_dmy;
-	bool fallback;
-};
-
-struct OmniLogMapBaseResult
-{
-	float2 d;
-	float lambda0;
-	float theta0;
-	float sin_theta0;
-	float cos_theta0;
-	float sin_lambda0;
-	float cos_lambda0;
-	float q;
-	float gamma;
-	float sin_gamma;
-	float alpha;
-	float3 u;
-	float3 u0;
-	float3 w;
-	float3 v;
-	float3 e_lambda;
-	float3 e_theta;
-	bool fallback;
-};
-
-struct OmniLogMapPixelContext
-{
-	float2 pix;
-	float3 u;
-	float sin_lambda;
-	float cos_lambda;
-	float sin_theta;
-	float cos_theta;
-	bool valid;
-};
-
-struct OmniLogMapMeanContext
-{
-	float2 mean;
-	float lambda0;
-	float theta0;
-	float sin_theta0;
-	float cos_theta0;
-	float sin_lambda0;
-	float cos_lambda0;
-	float3 u0;
-	float3 e_lambda;
-	float3 e_theta;
-	bool valid;
-};
-
-// Per-(tile, Gaussian) log-map data. The log-map is evaluated once per tile at
-// the tile anchor pixel; each pixel then reconstructs its own delta with a
-// first-order expansion, instead of paying a full log-map per pixel.
-struct OmniLogMapTileResult
-{
-	float2 d;        // log-map delta at the tile anchor pixel
-	float ddx_dpx;   // d(delta) / d(pixel): in-tile first-order reconstruction
-	float ddx_dpy;
-	float ddy_dpx;
-	float ddy_dpy;
-	float ddx_dmx;   // d(delta) / d(mean pixel): consumed by the backward pass
-	float ddx_dmy;
-	float ddy_dmx;
-	float ddy_dmy;
-	bool fallback;
-};
 
 __forceinline__ __device__ float clampf(float v, float lo, float hi)
 {
@@ -138,502 +63,155 @@ __forceinline__ __device__ float3 mul3(const float3 a, const float s)
 	return { a.x * s, a.y * s, a.z * s };
 }
 
-__forceinline__ __device__ float omniPeriodicPixelDeltaX(const float pix_x, const float mean_x, const int W)
+__forceinline__ __device__ float3 cross3(const float3 a, const float3 b)
 {
-	float dx = pix_x - mean_x;
-	if (W > 0 && isFinite(dx))
+	return {
+		a.y * b.z - a.z * b.y,
+		a.z * b.x - a.x * b.z,
+		a.x * b.y - a.y * b.x
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Tangent-native spherical log-map.
+//
+// The Gaussian is evaluated directly in the tangent plane of its mean ray
+// u0 on the unit sphere, in "equator pixel" units: one unit equals one ERP
+// pixel of geodesic distance at the equator. The pixel delta of a pixel ray
+// u is
+//
+//     d = alpha(q) * ( dot(u, ex), dot(u, ey) ),
+//     q = dot(u, u0) = cos(gamma),  alpha = gamma / sin(gamma),
+//
+// where ex = (W/2pi) e_phi and ey = -(H/pi) e_theta are the pixel-scaled
+// tangent basis vectors at u0. This uses dot(log_{u0}(u), e) =
+// alpha * dot(u, e) for any e orthogonal to u0, so no residual vector or
+// explicit (lambda, theta) coordinates are ever formed. |d| is the exact
+// geodesic distance (scaled); there is no ERP distortion, no seam, and no
+// pole singularity, hence no fallback path.
+// ---------------------------------------------------------------------------
+
+// Per-Gaussian tangent frame, built once in preprocess (without any
+// trigonometric call) and consumed as three coalesced float4 loads by the
+// render kernels.
+struct OmniTangentFrame
+{
+	float4 u0_st;  // xyz: u0 (unit mean ray, camera space), w: sin(theta0)
+	float4 ex_ct;  // xyz: ex = (W/2pi) * e_phi,             w: cos(theta0)
+	float4 ey_d;   // xyz: ey = -(H/pi) * e_theta,           w: depth |t|
+};
+
+// Geometry of the tangent frame at camera-space position t. Shared between
+// the forward preprocessing and the covariance backward so both passes see
+// bit-identical values.
+struct OmniTangentGeom
+{
+	float r;          // |t| (epsilon-guarded)
+	float r_xz;       // sqrt(tx^2 + tz^2) (epsilon-guarded)
+	float sin_theta0; // -ty / r
+	float cos_theta0; // r_xz_raw / r  (>= 0)
+	float3 u0;        // t / r
+	float3 e_phi;     // unit azimuth tangent:   (cos(phi0), 0, -sin(phi0))
+	float3 e_theta;   // unit elevation tangent: e_phi x u0
+};
+
+__forceinline__ __device__ OmniTangentGeom makeOmniTangentGeom(const float3 t)
+{
+	const float e = 0.0000001f;
+	OmniTangentGeom g;
+	const float r_xz_raw = sqrtf(t.x * t.x + t.z * t.z);
+	g.r = sqrtf(t.x * t.x + t.y * t.y + t.z * t.z) + e;
+	g.r_xz = r_xz_raw + e;
+	const float inv_r = 1.0f / g.r;
+	g.u0 = { t.x * inv_r, t.y * inv_r, t.z * inv_r };
+	g.sin_theta0 = -t.y * inv_r;
+	g.cos_theta0 = r_xz_raw * inv_r;
+	if (r_xz_raw > 1.0e-6f)
 	{
-		const float Wf = (float)W;
-		dx = fmodf(dx + 0.5f * Wf, Wf);
-		if (dx < 0.0f)
-			dx += Wf;
-		dx -= 0.5f * Wf;
+		const float inv_r_xz = 1.0f / r_xz_raw;
+		g.e_phi = { t.z * inv_r_xz, 0.0f, -t.x * inv_r_xz };
 	}
-	return dx;
+	else
+	{
+		// Exactly at a pole the azimuth is arbitrary; any tangent direction
+		// gives a valid frame as long as the covariance is expressed in the
+		// same frame (it is, see computeTangentCov2D).
+		g.e_phi = { 1.0f, 0.0f, 0.0f };
+	}
+	g.e_theta = cross3(g.e_phi, g.u0);
+	return g;
 }
 
-__forceinline__ __device__ float2 omniPixelDeltaFallback(const float2 pix, const float2 mean, const int W)
-{
-	return { omniPeriodicPixelDeltaX(pix.x, mean.x, W), pix.y - mean.y };
-}
-
-__forceinline__ __device__ OmniLogMapBaseResult makeOmniLogMapBaseFallback(
-	const float2 pix,
-	const float2 mean,
-	const int W)
-{
-	OmniLogMapBaseResult result;
-	result.d = omniPixelDeltaFallback(pix, mean, W);
-	result.lambda0 = 0.0f;
-	result.theta0 = 0.0f;
-	result.sin_theta0 = 0.0f;
-	result.cos_theta0 = 0.0f;
-	result.sin_lambda0 = 0.0f;
-	result.cos_lambda0 = 0.0f;
-	result.q = 0.0f;
-	result.gamma = 0.0f;
-	result.sin_gamma = 0.0f;
-	result.alpha = 1.0f;
-	result.u = { 0.0f, 0.0f, 1.0f };
-	result.u0 = { 0.0f, 0.0f, 1.0f };
-	result.w = { 0.0f, 0.0f, 0.0f };
-	result.v = { 0.0f, 0.0f, 0.0f };
-	result.e_lambda = { 1.0f, 0.0f, 0.0f };
-	result.e_theta = { 0.0f, -1.0f, 0.0f };
-	result.fallback = true;
-	return result;
-}
-
-__forceinline__ __device__ OmniLogMapPixelContext makeOmniLogMapPixelContext(
-	const float2 pix,
+__forceinline__ __device__ OmniTangentFrame makeOmniTangentFrame(
+	const OmniTangentGeom& g,
 	const int W,
-	const int H)
+	const int H,
+	const float depth)
 {
-	OmniLogMapPixelContext ctx;
-	ctx.pix = pix;
-	ctx.u = { 0.0f, 0.0f, 1.0f };
-	ctx.sin_lambda = 0.0f;
-	ctx.cos_lambda = 0.0f;
-	ctx.sin_theta = 0.0f;
-	ctx.cos_theta = 0.0f;
-	ctx.valid = false;
-
-	if (W <= 0 || H <= 0 || !isFinite(pix))
-		return ctx;
-
 	const float pi = 3.14159265358979323846f;
 	const float two_pi = 6.28318530717958647692f;
-	const float Wf = (float)W;
-	const float Hf = (float)H;
-	const float lambda = (pix.x / Wf - 0.5f) * two_pi;
-	const float theta = (0.5f - pix.y / Hf) * pi;
+	const float kx = (float)W / two_pi;
+	const float ky = (float)H / pi;
+	OmniTangentFrame f;
+	f.u0_st = { g.u0.x, g.u0.y, g.u0.z, g.sin_theta0 };
+	f.ex_ct = { kx * g.e_phi.x, kx * g.e_phi.y, kx * g.e_phi.z, g.cos_theta0 };
+	f.ey_d = { -ky * g.e_theta.x, -ky * g.e_theta.y, -ky * g.e_theta.z, depth };
+	return f;
+}
+
+// Unit ray direction of an ERP pixel. The only per-pixel trigonometry of the
+// whole rasterizer; each render thread calls this once per kernel launch.
+__forceinline__ __device__ float3 pixelRayDirection(const float2 pix, const int W, const int H)
+{
+	const float pi = 3.14159265358979323846f;
+	const float two_pi = 6.28318530717958647692f;
+	const float lambda = (pix.x / (float)W - 0.5f) * two_pi;
+	const float theta = (0.5f - pix.y / (float)H) * pi;
 	float sin_lambda, cos_lambda, sin_theta, cos_theta;
 	sincosf(lambda, &sin_lambda, &cos_lambda);
 	sincosf(theta, &sin_theta, &cos_theta);
-
-	if (!isFinite(lambda) || !isFinite(theta) ||
-		!isFinite(sin_lambda) || !isFinite(cos_lambda) ||
-		!isFinite(sin_theta) || !isFinite(cos_theta))
-		return ctx;
-
-	ctx.u = {
-		cos_theta * sin_lambda,
-		-sin_theta,
-		cos_theta * cos_lambda
-	};
-	ctx.sin_lambda = sin_lambda;
-	ctx.cos_lambda = cos_lambda;
-	ctx.sin_theta = sin_theta;
-	ctx.cos_theta = cos_theta;
-	ctx.valid = true;
-	return ctx;
+	return { cos_theta * sin_lambda, -sin_theta, cos_theta * cos_lambda };
 }
 
-__forceinline__ __device__ OmniLogMapMeanContext makeOmniLogMapMeanContext(
-	const float2 mean,
-	const int W,
-	const int H)
+// Treatment of q = dot(u, u0) before evaluating the log-map scale:
+//  - contributions with q <= OMNI_Q_CUTOFF (gamma > ~177.4 deg) are skipped
+//    by the render kernels: the log-map is ill-defined towards the antipode
+//    (at q = -1 the tangent projection vanishes, which would turn into a
+//    spurious full-strength splat). Testing with !(q > OMNI_Q_CUTOFF) also
+//    filters NaNs.
+//  - the upper clamp OMNI_Q_MAX keeps (1 - q)(1 + q) away from zero; the
+//    alpha error it introduces is below 1e-7 (gamma < 4.5e-4 rad there).
+#define OMNI_Q_CUTOFF (-0.999f)
+#define OMNI_Q_MAX (0.9999999f)
+
+// alpha^2(q) = gamma^2 / sin^2(gamma). The factored form (1 - q)(1 + q) for
+// sin^2(gamma) is cancellation-free near q = 1, unlike 1 - q*q.
+__forceinline__ __device__ float omniLogMapAlpha2(const float q)
 {
-	OmniLogMapMeanContext ctx;
-	ctx.mean = mean;
-	ctx.lambda0 = 0.0f;
-	ctx.theta0 = 0.0f;
-	ctx.sin_theta0 = 0.0f;
-	ctx.cos_theta0 = 0.0f;
-	ctx.sin_lambda0 = 0.0f;
-	ctx.cos_lambda0 = 0.0f;
-	ctx.u0 = { 0.0f, 0.0f, 0.0f };
-	ctx.e_lambda = { 0.0f, 0.0f, 0.0f };
-	ctx.e_theta = { 0.0f, 0.0f, 0.0f };
-	ctx.valid = false;
-
-	if (W <= 0 || H <= 0 || !isFinite(mean))
-		return ctx;
-
-	const float pi = 3.14159265358979323846f;
-	const float two_pi = 6.28318530717958647692f;
-	const float Wf = (float)W;
-	const float Hf = (float)H;
-	const float lambda0 = (mean.x / Wf - 0.5f) * two_pi;
-	const float theta0 = (0.5f - mean.y / Hf) * pi;
-	float sin_lambda0, cos_lambda0, sin_theta0, cos_theta0;
-	sincosf(lambda0, &sin_lambda0, &cos_lambda0);
-	sincosf(theta0, &sin_theta0, &cos_theta0);
-
-	if (!isFinite(lambda0) || !isFinite(theta0) ||
-		!isFinite(sin_lambda0) || !isFinite(cos_lambda0) ||
-		!isFinite(sin_theta0) || !isFinite(cos_theta0) ||
-		fabsf(cos_theta0) < 1.0e-4f)
-		return ctx;
-
-	ctx.lambda0 = lambda0;
-	ctx.theta0 = theta0;
-	ctx.sin_theta0 = sin_theta0;
-	ctx.cos_theta0 = cos_theta0;
-	ctx.sin_lambda0 = sin_lambda0;
-	ctx.cos_lambda0 = cos_lambda0;
-	ctx.u0 = {
-		cos_theta0 * sin_lambda0,
-		-sin_theta0,
-		cos_theta0 * cos_lambda0
-	};
-	ctx.e_lambda = {
-		cos_lambda0,
-		0.0f,
-		-sin_lambda0
-	};
-	ctx.e_theta = {
-		-sin_theta0 * sin_lambda0,
-		-cos_theta0,
-		-sin_theta0 * cos_lambda0
-	};
-	ctx.valid = true;
-	return ctx;
+	const float g = acosf(q);
+	const float s2 = (1.0f - q) * (1.0f + q);
+	return g * g / s2;
 }
 
-__forceinline__ __device__ float2 logMapOmniDeltaPixel(
-	const OmniLogMapPixelContext& pix_ctx,
-	const OmniLogMapMeanContext& mean_ctx,
-	const int W,
-	const int H)
+// alpha(q) and d(alpha)/dq for the backward pass.
+// d(alpha)/dq = (gamma*q - sin(gamma)) / sin^3(gamma); the numerator loses
+// all significant digits for small gamma, so switch to its Taylor expansion
+// -1/3 - 2*gamma^2/15 there.
+__forceinline__ __device__ void omniLogMapAlphaPair(const float q, float& alpha, float& dalpha_dq)
 {
-	const float2 fallback = omniPixelDeltaFallback(pix_ctx.pix, mean_ctx.mean, W);
-	if (W <= 0 || H <= 0 || !pix_ctx.valid || !mean_ctx.valid)
-		return fallback;
-
-	const float pi = 3.14159265358979323846f;
-	const float two_pi = 6.28318530717958647692f;
-	const float Wf = (float)W;
-	const float Hf = (float)H;
-
-	const float3 u0 = mean_ctx.u0;
-	const float3 e_lambda = mean_ctx.e_lambda;
-	const float3 e_theta = mean_ctx.e_theta;
-
-	const float q = dot3(pix_ctx.u, u0);
-	if (!isFinite(q))
-		return fallback;
-
-	const float q_clamped = clampf(q, -1.0f, 1.0f);
-	const float gamma = acosf(q_clamped);
-	const float sin_gamma = sinf(gamma);
-	if (!isFinite(gamma) || !isFinite(sin_gamma) ||
-		gamma < 1.0e-6f || fabsf(sin_gamma) < 1.0e-6f)
-		return fallback;
-
-	const float gamma2 = gamma * gamma;
-	const float alpha = (gamma < 1.0e-4f) ? (1.0f + gamma2 / 6.0f) : (gamma / sin_gamma);
-	const float3 w = sub3(pix_ctx.u, mul3(u0, q_clamped));
-	const float3 v = mul3(w, alpha);
-	const float xi = dot3(v, e_lambda);
-	const float eta = dot3(v, e_theta);
-	const float2 d = {
-		(xi / mean_ctx.cos_theta0) * Wf / two_pi,
-		-eta * Hf / pi
-	};
-
-	if (!isFinite(alpha) || !isFinite(w) || !isFinite(v) || !isFinite(d))
-		return fallback;
-	return d;
-}
-
-__forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
-	const OmniLogMapPixelContext& pix_ctx,
-	const OmniLogMapMeanContext& mean_ctx,
-	const int W,
-	const int H)
-{
-	OmniLogMapBaseResult result = makeOmniLogMapBaseFallback(pix_ctx.pix, mean_ctx.mean, W);
-	if (W <= 0 || H <= 0 || !pix_ctx.valid || !mean_ctx.valid)
-		return result;
-
-	const float pi = 3.14159265358979323846f;
-	const float two_pi = 6.28318530717958647692f;
-	const float Wf = (float)W;
-	const float Hf = (float)H;
-
-	const float3 u0 = mean_ctx.u0;
-	const float3 e_lambda = mean_ctx.e_lambda;
-	const float3 e_theta = mean_ctx.e_theta;
-
-	const float q = dot3(pix_ctx.u, u0);
-	if (!isFinite(q))
-		return result;
-
-	const float q_clamped = clampf(q, -1.0f, 1.0f);
-	const float gamma = acosf(q_clamped);
-	const float sin_gamma = sinf(gamma);
-
-	if (!isFinite(gamma) || !isFinite(sin_gamma) ||
-		gamma < 1.0e-6f || fabsf(sin_gamma) < 1.0e-6f)
-		return result;
-
-	const float gamma2 = gamma * gamma;
-	const float alpha = (gamma < 1.0e-4f) ? (1.0f + gamma2 / 6.0f) : (gamma / sin_gamma);
-	const float3 w = sub3(pix_ctx.u, mul3(u0, q_clamped));
-	const float3 v = mul3(w, alpha);
-	const float xi = dot3(v, e_lambda);
-	const float eta = dot3(v, e_theta);
-	const float2 d = {
-		(xi / mean_ctx.cos_theta0) * Wf / two_pi,
-		-eta * Hf / pi
-	};
-
-	if (!isFinite(alpha) || !isFinite(w) || !isFinite(v) || !isFinite(d))
-		return result;
-
-	result.d = d;
-	result.lambda0 = mean_ctx.lambda0;
-	result.theta0 = mean_ctx.theta0;
-	result.sin_theta0 = mean_ctx.sin_theta0;
-	result.cos_theta0 = mean_ctx.cos_theta0;
-	result.sin_lambda0 = mean_ctx.sin_lambda0;
-	result.cos_lambda0 = mean_ctx.cos_lambda0;
-	result.q = q_clamped;
-	result.gamma = gamma;
-	result.sin_gamma = sin_gamma;
-	result.alpha = alpha;
-	result.u = pix_ctx.u;
-	result.u0 = u0;
-	result.w = w;
-	result.v = v;
-	result.e_lambda = e_lambda;
-	result.e_theta = e_theta;
-	result.fallback = false;
-	return result;
-}
-
-__forceinline__ __device__ OmniLogMapBaseResult computeOmniLogMapBase(
-	const float2 pix,
-	const float2 mean,
-	const int W,
-	const int H)
-{
-	const OmniLogMapPixelContext pix_ctx = makeOmniLogMapPixelContext(pix, W, H);
-	const OmniLogMapMeanContext mean_ctx = makeOmniLogMapMeanContext(mean, W, H);
-	return computeOmniLogMapBase(pix_ctx, mean_ctx, W, H);
-}
-
-__forceinline__ __device__ float2 logMapOmniDeltaPixel(
-	const float2 pix,
-	const float2 mean,
-	const int W,
-	const int H)
-{
-	const OmniLogMapPixelContext pix_ctx = makeOmniLogMapPixelContext(pix, W, H);
-	const OmniLogMapMeanContext mean_ctx = makeOmniLogMapMeanContext(mean, W, H);
-	return logMapOmniDeltaPixel(pix_ctx, mean_ctx, W, H);
-}
-
-__forceinline__ __device__ OmniLogMapDeltaResult logMapOmniDeltaPixelWithMeanJacobian(
-	const OmniLogMapBaseResult& base,
-	const int W,
-	const int H)
-{
-	OmniLogMapDeltaResult result;
-	result.d = base.d;
-	result.ddx_dmx = -1.0f;
-	result.ddx_dmy = 0.0f;
-	result.ddy_dmx = 0.0f;
-	result.ddy_dmy = -1.0f;
-	result.fallback = true;
-
-	if (base.fallback)
-		return result;
-
-	const float pi = 3.14159265358979323846f;
-	const float two_pi = 6.28318530717958647692f;
-	const float Wf = (float)W;
-	const float Hf = (float)H;
-	const float pixel_x_scale = Wf / two_pi;
-	const float pixel_y_scale = Hf / pi;
-
-	const float sin_theta0 = base.sin_theta0;
-	const float cos_theta0 = base.cos_theta0;
-	const float sin_lambda0 = base.sin_lambda0;
-	const float cos_lambda0 = base.cos_lambda0;
-	const float q = base.q;
-	const float gamma = base.gamma;
-	const float sin_gamma = base.sin_gamma;
-	// cos(gamma) == cos(acos(q)) == q, so reuse base.q instead of a cosf call.
-	const float cos_gamma = q;
-	const float alpha = base.alpha;
-	const float xi = dot3(base.v, base.e_lambda);
-
-	const float dalpha_dgamma = (gamma < 1.0e-4f) ?
-		(gamma / 3.0f) :
-		((sin_gamma - gamma * cos_gamma) / (sin_gamma * sin_gamma));
-
-	const float inv_sin_gamma = 1.0f / sin_gamma;
-	const float inv_cos_theta0 = 1.0f / cos_theta0;
-	const float inv_cos_theta0_2 = inv_cos_theta0 * inv_cos_theta0;
-
-	const float3 du0_dlambda0 = mul3(base.e_lambda, cos_theta0);
-	const float3 du0_dtheta0 = base.e_theta;
-	const float3 de_lambda_dlambda0 = {
-		-sin_lambda0,
-		0.0f,
-		-cos_lambda0
-	};
-	const float3 de_lambda_dtheta0 = { 0.0f, 0.0f, 0.0f };
-	const float3 de_theta_dlambda0 = {
-		-sin_theta0 * cos_lambda0,
-		0.0f,
-		sin_theta0 * sin_lambda0
-	};
-	const float3 de_theta_dtheta0 = {
-		-cos_theta0 * sin_lambda0,
-		sin_theta0,
-		-cos_theta0 * cos_lambda0
-	};
-
-	const float dq_dlambda0 = dot3(base.u, du0_dlambda0);
-	const float dgamma_dlambda0 = -dq_dlambda0 * inv_sin_gamma;
-	const float dalpha_dlambda0 = dalpha_dgamma * dgamma_dlambda0;
-	const float3 dw_dlambda0 = sub3(mul3(base.u0, -dq_dlambda0), mul3(du0_dlambda0, q));
-	const float3 dv_dlambda0 = add3(mul3(base.w, dalpha_dlambda0), mul3(dw_dlambda0, alpha));
-	const float dxi_dlambda0 = dot3(dv_dlambda0, base.e_lambda) + dot3(base.v, de_lambda_dlambda0);
-	const float deta_dlambda0 = dot3(dv_dlambda0, base.e_theta) + dot3(base.v, de_theta_dlambda0);
-
-	const float dq_dtheta0 = dot3(base.u, du0_dtheta0);
-	const float dgamma_dtheta0 = -dq_dtheta0 * inv_sin_gamma;
-	const float dalpha_dtheta0 = dalpha_dgamma * dgamma_dtheta0;
-	const float3 dw_dtheta0 = sub3(mul3(base.u0, -dq_dtheta0), mul3(du0_dtheta0, q));
-	const float3 dv_dtheta0 = add3(mul3(base.w, dalpha_dtheta0), mul3(dw_dtheta0, alpha));
-	const float dxi_dtheta0 = dot3(dv_dtheta0, base.e_lambda) + dot3(base.v, de_lambda_dtheta0);
-	const float deta_dtheta0 = dot3(dv_dtheta0, base.e_theta) + dot3(base.v, de_theta_dtheta0);
-
-	const float ddx_dlambda0 = pixel_x_scale * dxi_dlambda0 * inv_cos_theta0;
-	const float ddy_dlambda0 = -pixel_y_scale * deta_dlambda0;
-	const float ddx_dtheta0 = pixel_x_scale *
-		(dxi_dtheta0 * inv_cos_theta0 - xi * (-sin_theta0) * inv_cos_theta0_2);
-	const float ddy_dtheta0 = -pixel_y_scale * deta_dtheta0;
-
-	result.ddx_dmx = ddx_dlambda0 * two_pi / Wf;
-	result.ddy_dmx = ddy_dlambda0 * two_pi / Wf;
-	result.ddx_dmy = ddx_dtheta0 * (-pi / Hf);
-	result.ddy_dmy = ddy_dtheta0 * (-pi / Hf);
-
-	result.fallback = false;
-	return result;
-}
-
-__forceinline__ __device__ OmniLogMapDeltaResult logMapOmniDeltaPixelWithMeanJacobian(
-	const OmniLogMapPixelContext& pix_ctx,
-	const OmniLogMapMeanContext& mean_ctx,
-	const int W,
-	const int H)
-{
-	const OmniLogMapBaseResult base = computeOmniLogMapBase(pix_ctx, mean_ctx, W, H);
-	return logMapOmniDeltaPixelWithMeanJacobian(base, W, H);
-}
-
-__forceinline__ __device__ OmniLogMapDeltaResult logMapOmniDeltaPixelWithMeanJacobian(
-	const float2 pix,
-	const float2 mean,
-	const int W,
-	const int H)
-{
-	const OmniLogMapBaseResult base = computeOmniLogMapBase(pix, mean, W, H);
-	return logMapOmniDeltaPixelWithMeanJacobian(base, W, H);
-}
-
-// Evaluate the log-map once at the tile anchor pixel. Returns the anchor delta,
-// the in-tile pixel Jacobian (for first-order per-pixel reconstruction) and the
-// mean Jacobian (for the backward pass). Computing this once per (tile,
-// Gaussian) instead of once per (pixel, Gaussian) amortises the transcendental
-// work over the whole 16x16 tile.
-__forceinline__ __device__ OmniLogMapTileResult computeOmniLogMapTile(
-	const OmniLogMapPixelContext& anchor_ctx,
-	const OmniLogMapMeanContext& mean_ctx,
-	const int W,
-	const int H)
-{
-	const OmniLogMapBaseResult base = computeOmniLogMapBase(anchor_ctx, mean_ctx, W, H);
-	const OmniLogMapDeltaResult mean_jac = logMapOmniDeltaPixelWithMeanJacobian(base, W, H);
-
-	OmniLogMapTileResult result;
-	result.d = base.d;
-	result.ddx_dmx = mean_jac.ddx_dmx;
-	result.ddx_dmy = mean_jac.ddx_dmy;
-	result.ddy_dmx = mean_jac.ddy_dmx;
-	result.ddy_dmy = mean_jac.ddy_dmy;
-	// Fallback delta is the (periodic) pixel-minus-mean offset, which is already
-	// exactly linear in the pixel coordinate -> identity in-tile Jacobian.
-	result.ddx_dpx = 1.0f;
-	result.ddx_dpy = 0.0f;
-	result.ddy_dpx = 0.0f;
-	result.ddy_dpy = 1.0f;
-	result.fallback = base.fallback;
-
-	if (result.fallback)
-		return result;
-
-	const float pi = 3.14159265358979323846f;
-	const float two_pi = 6.28318530717958647692f;
-	const float Wf = (float)W;
-	const float Hf = (float)H;
-	const float pixel_x_scale = Wf / two_pi;
-	const float pixel_y_scale = Hf / pi;
-
-	// d(delta)/d(u), where u is the pixel ray direction. The mean tangent frame
-	// (e_lambda, e_theta, cos_theta0) does not depend on the pixel, so this is
-	// simpler than the mean Jacobian (no frame-derivative terms).
-	const float cos_gamma = base.q;  // cos(acos(q)) == q
-	const float dalpha_dgamma = (base.gamma < 1.0e-4f) ?
-		(base.gamma / 3.0f) :
-		((base.sin_gamma - base.gamma * cos_gamma) / (base.sin_gamma * base.sin_gamma));
-	const float c_alpha = -dalpha_dgamma / base.sin_gamma;
-
-	// e_lambda . u0 == e_theta . u0 == 0, so d(xi)/d(u) and d(eta)/d(u) reduce:
-	const float el_dot_w = dot3(base.e_lambda, base.w);
-	const float et_dot_w = dot3(base.e_theta, base.w);
-	const float3 dxi_du = add3(mul3(base.e_lambda, base.alpha), mul3(base.u0, c_alpha * el_dot_w));
-	const float3 deta_du = add3(mul3(base.e_theta, base.alpha), mul3(base.u0, c_alpha * et_dot_w));
-
-	const float inv_cos_theta0 = 1.0f / base.cos_theta0;
-	const float3 ddx_du = mul3(dxi_du, pixel_x_scale * inv_cos_theta0);
-	const float3 ddy_du = mul3(deta_du, -pixel_y_scale);
-
-	// d(u)/d(pixel) at the anchor pixel.
-	const float ct = anchor_ctx.cos_theta;
-	const float st = anchor_ctx.sin_theta;
-	const float cl = anchor_ctx.cos_lambda;
-	const float sl = anchor_ctx.sin_lambda;
-	const float3 du_dlambda = { ct * cl, 0.0f, -ct * sl };
-	const float3 du_dtheta = { -st * sl, -ct, -st * cl };
-	const float3 du_dpx = mul3(du_dlambda, two_pi / Wf);
-	const float3 du_dpy = mul3(du_dtheta, -pi / Hf);
-
-	const float ddx_dpx = dot3(ddx_du, du_dpx);
-	const float ddx_dpy = dot3(ddx_du, du_dpy);
-	const float ddy_dpx = dot3(ddy_du, du_dpx);
-	const float ddy_dpy = dot3(ddy_du, du_dpy);
-
-	// Keep the identity in-tile Jacobian if anything went non-finite.
-	if (isFinite(ddx_dpx) && isFinite(ddx_dpy) && isFinite(ddy_dpx) && isFinite(ddy_dpy))
+	const float g = acosf(q);
+	const float s2 = (1.0f - q) * (1.0f + q);
+	const float inv_s = rsqrtf(s2);
+	alpha = g * inv_s;
+	if (g < 0.03f)
 	{
-		result.ddx_dpx = ddx_dpx;
-		result.ddx_dpy = ddx_dpy;
-		result.ddy_dpx = ddy_dpx;
-		result.ddy_dpy = ddy_dpy;
+		dalpha_dq = -(1.0f / 3.0f) - (2.0f / 15.0f) * g * g;
 	}
-	return result;
-}
-
-// First-order reconstruction of the per-pixel log-map delta within a tile,
-// from the anchor delta and the in-tile pixel Jacobian.
-__forceinline__ __device__ float2 applyOmniLogMapTile(
-	const OmniLogMapTileResult& lm,
-	const float2 pix,
-	const float2 anchor)
-{
-	const float dpx = pix.x - anchor.x;
-	const float dpy = pix.y - anchor.y;
-	return {
-		lm.d.x + lm.ddx_dpx * dpx + lm.ddx_dpy * dpy,
-		lm.d.y + lm.ddy_dpx * dpx + lm.ddy_dpy * dpy
-	};
+	else
+	{
+		const float sin_g = s2 * inv_s;
+		dalpha_dq = (g * q - sin_g) * inv_s * inv_s * inv_s;
+	}
 }
 
 // Spherical harmonics coefficients
@@ -659,18 +237,6 @@ __device__ const float SH_C3[] = {
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {
 	return ((v + 1.0) * S - 1.0) * 0.5;
-}
-
-__forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
-{
-	rect_min = {
-		min(grid.x, max((int)0, (int)((p.x - max_radius) / BLOCK_X))),
-		min(grid.y, max((int)0, (int)((p.y - max_radius) / BLOCK_Y)))
-	};
-	rect_max = {
-		min(grid.x, max((int)0, (int)((p.x + max_radius + BLOCK_X - 1) / BLOCK_X))),
-		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
-	};
 }
 
 struct OmniTileBounds
@@ -721,16 +287,23 @@ __forceinline__ __device__ void getRectFromPixelBounds(
 	};
 }
 
-__forceinline__ __device__ OmniTileBounds getOmniLogMapTileBounds(
-	const float2 p,
-	const int max_radius,
+// Tile candidates of a Gaussian: the spherical cap of geodesic radius
+// gamma_max around the mean direction, mapped to its ERP bounding box.
+// Splits into two rectangles when the box crosses the azimuth seam; expands
+// to the full row band when the cap touches a pole.
+__forceinline__ __device__ OmniTileBounds getOmniCapTileBounds(
+	const float center_px_x,
+	const float theta0,
+	const float cos_theta0,
+	const float gamma_max,
 	const int W,
 	const int H,
 	dim3 grid)
 {
 	OmniTileBounds bounds;
 	clearOmniTileBounds(bounds);
-	if (max_radius <= 0 || W <= 0 || H <= 0 || !isFinite(p))
+	if (W <= 0 || H <= 0 || !isFinite(center_px_x) || !isFinite(theta0) ||
+		!isFinite(gamma_max) || gamma_max <= 0.0f)
 		return bounds;
 
 	const float pi = 3.14159265358979323846f;
@@ -738,32 +311,11 @@ __forceinline__ __device__ OmniTileBounds getOmniLogMapTileBounds(
 	const float Wf = (float)W;
 	const float Hf = (float)H;
 
-	float center_x = fmodf(p.x, Wf);
+	float center_x = fmodf(center_px_x, Wf);
 	if (center_x < 0.0f)
 		center_x += Wf;
-	const float theta0 = (0.5f - p.y / Hf) * pi;
-	const float cos_theta0 = cosf(theta0);
 
-	// The render kernel evaluates the Gaussian in log-map tangent coordinates.
-	// Use a spherical cap that conservatively contains the tangent-pixel radius.
-	const float tangent_x_scale = two_pi / Wf * fabsf(cos_theta0);
-	const float tangent_y_scale = pi / Hf;
-	const float gamma_max = (float)max_radius * fmaxf(tangent_x_scale, tangent_y_scale);
-
-	if (!isFinite(center_x) || !isFinite(theta0) || !isFinite(cos_theta0) || !isFinite(gamma_max))
-	{
-		getRectFromPixelBounds(0.0f, Wf - 1.0f, p.y - max_radius, p.y + max_radius, bounds.rect_min0, bounds.rect_max0, grid);
-		bounds.rect_count = ((bounds.rect_max0.x - bounds.rect_min0.x) * (bounds.rect_max0.y - bounds.rect_min0.y)) > 0 ? 1 : 0;
-		return bounds;
-	}
-
-	if (fabsf(cos_theta0) < 1.0e-4f)
-	{
-		getRectFromPixelBounds(0.0f, Wf - 1.0f, p.y - max_radius, p.y + max_radius, bounds.rect_min0, bounds.rect_max0, grid);
-		bounds.rect_count = ((bounds.rect_max0.x - bounds.rect_min0.x) * (bounds.rect_max0.y - bounds.rect_min0.y)) > 0 ? 1 : 0;
-		return bounds;
-	}
-
+	// Elevation band of the cap, mapped to pixel rows.
 	const float theta_min = clampf(theta0 - gamma_max, -0.5f * pi, 0.5f * pi);
 	const float theta_max = clampf(theta0 + gamma_max, -0.5f * pi, 0.5f * pi);
 	const float y_min = (0.5f - theta_max / pi) * Hf;
@@ -907,7 +459,7 @@ __forceinline__ __device__ bool in_sphere(int idx,
 {
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 	p_view = transformPoint4x3(p_orig, viewmatrix);
-	
+
 	// Bring points to screen space
 	float dist = sqrt(p_view.x*p_view.x + p_view.y*p_view.y + p_view.z*p_view.z)+0.0000001f;
 

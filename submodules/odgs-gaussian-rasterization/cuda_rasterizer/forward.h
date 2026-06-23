@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -39,7 +39,7 @@ namespace FORWARD
 		float* psi,
 		float* lat,
 		float* lon,
-		OmniLogMapMeanContext* omni_mean,
+		OmniTangentFrame* frames,
 		OmniTileBounds* tile_bounds,
 		float* depths,
 		float* cov3Ds,
@@ -55,9 +55,8 @@ namespace FORWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
-		const OmniLogMapMeanContext* omni_mean,
+		const OmniTangentFrame* frames,
 		const float* features,
-		const float* depths,
 		const float4* conic_opacity,
 		float* final_T,
 		uint32_t* n_contrib,

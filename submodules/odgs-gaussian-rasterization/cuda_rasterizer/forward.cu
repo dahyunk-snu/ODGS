@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -19,8 +19,8 @@ namespace cg = cooperative_groups;
 // coefficients of each Gaussian to a simple RGB color.
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
 {
-	// The implementation is loosely based on code for 
-	// "Differentiable Point-Based Radiance Fields for 
+	// The implementation is loosely based on code for
+	// "Differentiable Point-Based Radiance Fields for
 	// Efficient View Synthesis" by Zhang et al. (2022)
 	glm::vec3 pos = means[idx];
 	glm::vec3 dir = pos - campos;
@@ -70,48 +70,47 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 	return glm::max(result, 0.0f);
 }
 
-
-// Forward version of 2D covariance matrix computation in omnidirectional image
-__device__ float3 computeOmniCov2D(float lon, float lat, float dist, const float* cov3D, const float* viewmatrix, const int height, const int width)
+// 2D covariance of the Gaussian in the tangent plane at its mean ray, in the
+// same equator-pixel units as the render-time log-map delta d. The world ->
+// delta Jacobian at the mean has the two rows
+//
+//     j0 = R^T ex / r,   j1 = R^T ey / r
+//
+// (R = world-to-camera rotation, r = |t|), because d(u)/d(t) = (I - u0 u0^T)/r
+// and ex, ey are orthogonal to u0. The EWA low-pass dilation is expressed in
+// the same units: one ERP pixel step spans cos(theta0) (azimuth) resp. 1
+// (elevation) equator pixels of geodesic distance at the mean, which makes
+// the resulting opacity field exactly equal to the pixel-unit formulation
+// Sigma_px = S Sigma_tan S^T + 0.3 I away from the poles, while staying
+// finite and well-conditioned at the poles.
+__device__ float3 computeTangentCov2D(
+	const float3 ex,
+	const float3 ey,
+	const float cos_theta0,
+	const float inv_r,
+	const float* cov3D,
+	const float* viewmatrix)
 {
-	// The following models the steps outlined by equations (5)-(8)
-	// in "ODGS" (Suyoung Lee et al., 2024). 
-	// Transposes used to account for row-/column-major conventions.
+	const float3 j0 = mul3(transformVec4x3Transpose(ex, viewmatrix), inv_r);
+	const float3 j1 = mul3(transformVec4x3Transpose(ey, viewmatrix), inv_r);
 
-	const float e = 0.0000001f;
-	const float x_scale = width/(2*M_PI);
-	const float y_scale = height/(M_PI);
+	// Sigma_3D * j (symmetric 3x3, packed upper triangle).
+	const float3 Sj0 = {
+		cov3D[0] * j0.x + cov3D[1] * j0.y + cov3D[2] * j0.z,
+		cov3D[1] * j0.x + cov3D[3] * j0.y + cov3D[4] * j0.z,
+		cov3D[2] * j0.x + cov3D[4] * j0.y + cov3D[5] * j0.z
+	};
+	const float3 Sj1 = {
+		cov3D[0] * j1.x + cov3D[1] * j1.y + cov3D[2] * j1.z,
+		cov3D[1] * j1.x + cov3D[3] * j1.y + cov3D[4] * j1.z,
+		cov3D[2] * j1.x + cov3D[4] * j1.y + cov3D[5] * j1.z
+	};
 
-	glm::mat3 SQJ = glm::mat3(
-		x_scale/((cos(lat) + e) * dist) , 0, 0,
-		0, y_scale/dist , 0,
-		0, 0, 0);
-
-	glm::mat3 T = glm::mat3(
-		cos(lon), 0.0f, -sin(lon),
-		sin(lat) * sin(lon), cos(lat), sin(lat) * cos(lon),
-		cos(lat) * sin(lon), -sin(lat), cos(lat) * cos(lon));
-
-	glm::mat3 W = glm::mat3(
-		viewmatrix[0], viewmatrix[4], viewmatrix[8],
-		viewmatrix[1], viewmatrix[5], viewmatrix[9],
-		viewmatrix[2], viewmatrix[6], viewmatrix[10]);
-
-	glm::mat3 J_o = W * T * SQJ;
-
-	glm::mat3 Vrk = glm::mat3(
-		cov3D[0], cov3D[1], cov3D[2],
-		cov3D[1], cov3D[3], cov3D[4],
-		cov3D[2], cov3D[4], cov3D[5]);
-
-	glm::mat3 cov = glm::transpose(J_o) * glm::transpose(Vrk) * J_o;
-
-	// Apply low-pass filter: every Gaussian should be at least
-	// one pixel wide/high. Discard 3rd row and column.
-	cov[0][0] += 0.3f;
-	cov[1][1] += 0.3f;
-
-	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
+	return {
+		dot3(j0, Sj0) + 0.3f * cos_theta0 * cos_theta0,
+		dot3(j0, Sj1),
+		dot3(j1, Sj1) + 0.3f
+	};
 }
 
 // Forward method for converting scale and rotation properties of each
@@ -172,7 +171,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float* psi,
 	float* lat,
 	float* lon,
-	OmniLogMapMeanContext* omni_mean,
+	OmniTangentFrame* frames,
 	OmniTileBounds* stored_tile_bounds,
 	float* depths,
 	float* cov3Ds,
@@ -196,16 +195,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if (!in_sphere(idx, orig_points, viewmatrix, prefiltered, p_view))
 		return;
 
-	// Transform point by projecting
-	float dist = sqrt(p_view.x*p_view.x + p_view.y*p_view.y + p_view.z*p_view.z)+0.0000001f;
-	float dist_xz = sqrt(p_view.x*p_view.x + p_view.z*p_view.z)+0.0000001f;
-	
-	float my_lat = atan2(-p_view.y, dist_xz);
-	float my_lon = atan2(p_view.x, p_view.z);
-	float2 point_image = { (my_lon/M_PI+1.0f)*W/2.0f, (0.5f-my_lat/M_PI)*H };
+	// Tangent frame at the mean ray, built algebraically from the camera-space
+	// position (no trigonometric call). atan2 is only needed for the pixel
+	// position of the mean (tile binning / densification statistics).
+	const OmniTangentGeom geom = makeOmniTangentGeom(p_view);
+	const float my_lat = atan2f(-p_view.y, geom.r_xz);
+	const float my_lon = atan2f(p_view.x, p_view.z);
+	const float2 point_image = { (my_lon / (float)M_PI + 1.0f) * W / 2.0f, (0.5f - my_lat / (float)M_PI) * H };
 
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
-	// from scaling and rotation parameters. 
+	// from scaling and rotation parameters.
 	const float* cov3D;
 	if (cov3D_precomp != nullptr)
 	{
@@ -217,8 +216,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		cov3D = cov3Ds + idx * 6;
 	}
 
-	// Compute 2D screen-space covariance matrix
-	float3 cov = computeOmniCov2D(my_lon, my_lat, dist, cov3D, viewmatrix, H, W);
+	// Compute 2D covariance in the tangent plane (equator-pixel units).
+	const float pi = 3.14159265358979323846f;
+	const float two_pi = 6.28318530717958647692f;
+	const float3 ex = mul3(geom.e_phi, (float)W / two_pi);
+	const float3 ey = mul3(geom.e_theta, -(float)H / pi);
+	float3 cov = computeTangentCov2D(ex, ey, geom.cos_theta0, 1.0f / geom.r, cov3D, viewmatrix);
 
 	// Invert covariance (EWA algorithm)
 	float det = (cov.x * cov.z - cov.y * cov.y);
@@ -227,17 +230,19 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float det_inv = 1.f / det;
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
-	// Compute extent in screen space (by finding eigenvalues of
-	// 2D covariance matrix). Use extent to compute a bounding rectangle
-	// of screen-space tiles that this Gaussian overlaps with. Quit if
-	// rectangle covers 0 tiles. 
+	// Compute extent in the tangent plane (by finding eigenvalues of the
+	// 2D covariance matrix), then bin the Gaussian to the tiles covered by
+	// the spherical cap of that geodesic radius. Quit if it covers 0 tiles.
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
 	int my_radius = (int)ceil(3.f * sqrt(max(lambda1, lambda2)));
 	float my_psi = 0.5f * atan2(2*cov.y, cov.x - cov.z);
-	
-	OmniTileBounds tile_bounds = getOmniLogMapTileBounds(point_image, my_radius, W, H, grid);
+
+	// One equator-pixel unit spans 2pi/W (azimuth) resp. pi/H (elevation)
+	// radians of geodesic distance; take the max for a conservative cap.
+	const float gamma_max = (float)my_radius * fmaxf(two_pi / (float)W, pi / (float)H);
+	OmniTileBounds tile_bounds = getOmniCapTileBounds(point_image.x, my_lat, geom.cos_theta0, gamma_max, W, H, grid);
 	stored_tile_bounds[idx] = tile_bounds;
 	const uint32_t tile_count = getOmniTileBoundsTileCount(tile_bounds);
 	if (tile_count == 0)
@@ -258,16 +263,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	lon[idx] = my_lon;
 	psi[idx] = my_psi;
 	// Store some useful helper data for the next steps.
-	depths[idx] = dist;
+	depths[idx] = geom.r;
 	radii[idx] = my_radius;
-	omni_mean[idx] = makeOmniLogMapMeanContext(point_image, W, H);
+	frames[idx] = makeOmniTangentFrame(geom, W, H, geom.r);
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
 	tiles_touched[idx] = tile_count;
 }
 
 // Main rasterization method. Collaboratively works on one tile per
-// block, each thread treats one pixel. Alternates between fetching 
+// block, each thread treats one pixel. Alternates between fetching
 // and rasterizing data.
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
@@ -275,9 +280,8 @@ renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
-	const OmniLogMapMeanContext* __restrict__ omni_mean,
+	const OmniTangentFrame* __restrict__ frames,
 	const float* __restrict__ features,
-	const float* __restrict__ depths,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
@@ -294,10 +298,9 @@ renderCUDA(
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x, (float)pix.y };
-	// Tile anchor: the log-map is evaluated once here per Gaussian, then each
-	// pixel reconstructs its own delta with a first-order expansion.
-	const float2 tile_anchor = { (float)pix_min.x + BLOCK_X * 0.5f, (float)pix_min.y + BLOCK_Y * 0.5f };
-	const OmniLogMapPixelContext anchor_omni = makeOmniLogMapPixelContext(tile_anchor, W, H);
+	// The pixel ray direction is the only per-pixel quantity the log-map
+	// needs; computed once per thread for the whole Gaussian list.
+	const float3 u = pixelRayDirection(pixf, W, H);
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W && pix.y < H;
@@ -311,9 +314,8 @@ renderCUDA(
 
 	// Allocate storage for batches of collectively fetched data.
 	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ OmniLogMapTileResult collected_tile_lm[BLOCK_SIZE];
+	__shared__ OmniTangentFrame collected_frame[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
-	__shared__ float collected_depth[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -337,9 +339,8 @@ renderCUDA(
 		{
 			int coll_id = point_list[range.x + progress];
 			collected_id[block.thread_rank()] = coll_id;
-			collected_tile_lm[block.thread_rank()] = computeOmniLogMapTile(anchor_omni, omni_mean[coll_id], W, H);
+			collected_frame[block.thread_rank()] = frames[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			collected_depth[block.thread_rank()] = depths[coll_id];
 		}
 		block.sync();
 
@@ -349,18 +350,29 @@ renderCUDA(
 			// Keep track of current position in range
 			contributor++;
 
-			// Resample using conic matrix (cf. "Surface 
+			// Exact spherical log-map delta of this pixel, evaluated in the
+			// Gaussian's tangent frame: d = alpha(q) * (dot(u, ex), dot(u, ey)).
+			// alpha^2 is folded into the quadratic form instead of scaling d.
+			const OmniTangentFrame f = collected_frame[j];
+			const float q = u.x * f.u0_st.x + u.y * f.u0_st.y + u.z * f.u0_st.z;
+			if (!(q > OMNI_Q_CUTOFF))
+				continue;
+			const float qc = fminf(q, OMNI_Q_MAX);
+			const float dx = u.x * f.ex_ct.x + u.y * f.ex_ct.y + u.z * f.ex_ct.z;
+			const float dy = u.x * f.ey_d.x + u.y * f.ey_d.y + u.z * f.ey_d.z;
+			const float a2 = omniLogMapAlpha2(qc);
+
+			// Resample using conic matrix (cf. "Surface
 			// Splatting" by Zwicker et al., 2001)
-			float2 d = applyOmniLogMapTile(collected_tile_lm[j], pixf, tile_anchor);
 			float4 con_o = collected_conic_opacity[j];
-			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			float power = -0.5f * a2 * (con_o.x * dx * dx + con_o.z * dy * dy) - a2 * con_o.y * dx * dy;
 			if (power > 0.0f)
 				continue;
 
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
-			// Avoid numerical instabilities (see paper appendix). 
+			// Avoid numerical instabilities (see paper appendix).
 			float alpha = min(0.99f, con_o.w * exp(power));
 			if (alpha < 1.0f / 255.0f)
 				continue;
@@ -374,7 +386,7 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
-			D += collected_depth[j] * alpha * T;
+			D += f.ey_d.w * alpha * T;
 			A += alpha * T;
 			T = test_T;
 
@@ -401,9 +413,8 @@ void FORWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
-	const OmniLogMapMeanContext* omni_mean,
+	const OmniTangentFrame* frames,
 	const float* colors,
-	const float* depths,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
@@ -416,9 +427,8 @@ void FORWARD::render(
 		ranges,
 		point_list,
 		W, H,
-		omni_mean,
+		frames,
 		colors,
-		depths,
 		conic_opacity,
 		final_T,
 		n_contrib,
@@ -445,7 +455,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float* psi,
 	float* lat,
 	float* lon,
-	OmniLogMapMeanContext* omni_mean,
+	OmniTangentFrame* frames,
 	OmniTileBounds* tile_bounds,
 	float* depths,
 	float* cov3Ds,
@@ -466,14 +476,14 @@ void FORWARD::preprocess(int P, int D, int M,
 		clamped,
 		cov3D_precomp,
 		colors_precomp,
-		viewmatrix, 
+		viewmatrix,
 		cam_pos,
 		W, H,
 		radii,
 		psi,
 		lat,
 		lon,
-		omni_mean,
+		frames,
 		tile_bounds,
 		depths,
 		cov3Ds,
