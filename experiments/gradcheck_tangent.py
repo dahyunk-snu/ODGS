@@ -8,6 +8,16 @@ and seam-heavy ERP scenes.
 CUDA atomics can make the backward slightly nondeterministic. The
 analytic gradients reported here come from one backward call per scene.
 
+The rasterizer is only piecewise smooth. Hard events include the
+alpha < 1/255 contribution cutoff, alpha = min(0.99, sigma*G) clamp,
+power > 0 skip, integer tile/row coverage changes from
+getOmniCapTileBounds, SH color clamping at 0, and depth-sort order
+swaps. A central difference crossing one of these events measures a
+secant with a jump term, not the local analytic derivative. This
+gradcheck therefore accepts agreement only on Richardson-consistent
+probes; a probe that IS Richardson-consistent but still disagrees with
+the analytic gradient indicates a real backward bug.
+
 Example:
     python experiments/gradcheck_tangent.py
 """
@@ -36,6 +46,9 @@ EPS_BY_TENSOR = {
     "opacities": 1.0e-3,
     "shs": 1.0e-3,
 }
+RICHARDSON_REL_TOL = 2.0e-2
+SKIP_ABS_FLOOR = 1.0e-6
+SKIP_RMS_SCALE = 1.0e-3
 
 
 def parse_name_subset(text, valid_names, option_name):
@@ -282,6 +295,46 @@ def finite_difference_one(scene, settings, weights, loss_terms, tensor_name, fla
             flat[flat_index] = original
 
 
+def finite_difference_richardson(scene, settings, weights, loss_terms, tensor_name, flat_index, eps):
+    fd_full = finite_difference_one(
+        scene,
+        settings,
+        weights,
+        loss_terms,
+        tensor_name,
+        flat_index,
+        eps,
+    )
+    if fd_full is None or not math.isfinite(fd_full):
+        return None
+
+    fd_half = finite_difference_one(
+        scene,
+        settings,
+        weights,
+        loss_terms,
+        tensor_name,
+        flat_index,
+        0.5 * eps,
+    )
+    if fd_half is None or not math.isfinite(fd_half):
+        return None
+
+    fd_rich = (4.0 * fd_half - fd_full) / 3.0
+    return float(fd_full), float(fd_half), float(fd_rich)
+
+
+def analytic_rms_floor(analytic_flat, candidate_indices, fallback_indices):
+    indices = candidate_indices if candidate_indices.size > 0 else fallback_indices
+    if indices.size == 0:
+        return 0.0, SKIP_ABS_FLOOR
+
+    index_tensor = torch.as_tensor(indices, dtype=torch.long, device=analytic_flat.device)
+    values = analytic_flat.index_select(0, index_tensor).double()
+    rms = float(torch.sqrt(torch.mean(values * values)).detach().cpu().item())
+    return rms, max(SKIP_ABS_FLOOR, SKIP_RMS_SCALE * rms)
+
+
 def summarize_errors(errors):
     if not errors:
         return float("inf"), float("inf"), float("inf")
@@ -316,16 +369,19 @@ def print_probe_rows(variant, tensor_name, probe_rows, count):
     print("")
     print("Probe diagnostics variant={} tensor={}".format(variant, tensor_name))
     if not probe_rows:
-        print("  no finite probes")
+        print("  no used probes")
         return
 
-    header = "  {:<5} {:>11} {:>14} {:>14} {:>22} {:>12}".format(
+    header = "  {:<5} {:>11} {:>14} {:>14} {:>14} {:>14} {:>14} {:>12} {:>5}".format(
         "rank",
         "flat_index",
         "analytic",
-        "fd",
-        "ratio_fd_over_analytic",
+        "fd_full",
+        "fd_half",
+        "fd_rich",
+        "ratio",
         "rel_err",
+        "evt",
     )
     worst = sorted(probe_rows, key=lambda row: row["rel_err"], reverse=True)[:count]
     best = sorted(probe_rows, key=lambda row: row["rel_err"])[:count]
@@ -335,15 +391,53 @@ def print_probe_rows(variant, tensor_name, probe_rows, count):
         print(header)
         for rank, row in enumerate(rows, 1):
             print(
-                "  {:<5d} {:>11d} {:>14} {:>14} {:>22} {:>12}".format(
+                "  {:<5d} {:>11d} {:>14} {:>14} {:>14} {:>14} {:>14} {:>12} {:>5}".format(
                     rank,
                     row["flat_index"],
                     format_metric(row["analytic"]),
-                    format_metric(row["fd"]),
+                    format_metric(row["fd_full"]),
+                    format_metric(row["fd_half"]),
+                    format_metric(row["fd_rich"]),
                     format_metric(row["ratio"]),
                     format_metric(row["rel_err"]),
+                    "yes" if row["event"] else "no",
                 )
             )
+
+
+def print_event_rows(variant, tensor_name, event_rows, count):
+    if count <= 0 or not event_rows:
+        return
+
+    print("")
+    print("Event probes variant={} tensor={}".format(variant, tensor_name))
+    header = "  {:<5} {:>11} {:>14} {:>14} {:>14} {:>14} {:>14} {:>12} {:>5}".format(
+        "rank",
+        "flat_index",
+        "analytic",
+        "fd_full",
+        "fd_half",
+        "fd_rich",
+        "ratio",
+        "rel_err",
+        "evt",
+    )
+    print(header)
+    rows = sorted(event_rows, key=lambda row: row["event_delta"], reverse=True)[:count]
+    for rank, row in enumerate(rows, 1):
+        print(
+            "  {:<5d} {:>11d} {:>14} {:>14} {:>14} {:>14} {:>14} {:>12} {:>5}".format(
+                rank,
+                row["flat_index"],
+                format_metric(row["analytic"]),
+                format_metric(row["fd_full"]),
+                format_metric(row["fd_half"]),
+                format_metric(row["fd_rich"]),
+                format_metric(row["ratio"]),
+                format_metric(row["rel_err"]),
+                "yes" if row["event"] else "no",
+            )
+        )
 
 
 def print_fit_scale(variant, tensor_name, probe_rows):
@@ -359,7 +453,7 @@ def print_fit_scale(variant, tensor_name, probe_rows):
         return
 
     analytic = np.asarray([row["analytic"] for row in usable], dtype=np.float64)
-    fd = np.asarray([row["fd"] for row in usable], dtype=np.float64)
+    fd = np.asarray([row["fd_rich"] for row in usable], dtype=np.float64)
     ratios = fd / analytic
     denom = float(np.sum(analytic * analytic))
     k_lsq = float(np.sum(fd * analytic) / denom) if denom > 0.0 else float("nan")
@@ -377,11 +471,13 @@ def print_fit_scale(variant, tensor_name, probe_rows):
 def print_table(rows):
     print("")
     print("Finite-difference relative errors")
-    header = "{:<8} {:<10} {:>7} {:>9} {:>12} {:>12} {:>12} {:>6}".format(
+    header = "{:<8} {:<10} {:>7} {:>8} {:>9} {:>12} {:>12} {:>12} {:>12} {:>6}".format(
         "variant",
         "tensor",
         "n_used",
-        "skipped",
+        "n_event",
+        "n_skipped",
+        "k_med",
         "median",
         "p90",
         "max",
@@ -391,11 +487,13 @@ def print_table(rows):
     print("-" * len(header))
     for row in rows:
         print(
-            "{:<8} {:<10} {:>7d} {:>9d} {:>12} {:>12} {:>12} {:>6}".format(
+            "{:<8} {:<10} {:>7d} {:>8d} {:>9d} {:>12} {:>12} {:>12} {:>12} {:>6}".format(
                 row["variant"],
                 row["tensor"],
                 row["n_used"],
+                row["n_event"],
                 row["n_skipped"],
+                format_metric(row["k_med"]),
                 format_metric(row["median"]),
                 format_metric(row["p90"]),
                 format_metric(row["max"]),
@@ -441,7 +539,9 @@ def run_variant(args, variant, variant_index, device):
                     "variant": variant,
                     "tensor": name,
                     "n_used": 0,
+                    "n_event": 0,
                     "n_skipped": 0,
+                    "k_med": float("inf"),
                     "median": float("inf"),
                     "p90": float("inf"),
                     "max": float("inf"),
@@ -462,6 +562,8 @@ def run_variant(args, variant, variant_index, device):
 
     fd_rng = np.random.RandomState(fd_seed)
     variant_ok = True
+    variant_event_count = 0
+    variant_probe_count = 0
     for name in args.tensors:
         candidates = visible_flat_indices(scene[name], visible)
         if candidates.size < max(1, int(args.probes) // 2):
@@ -479,45 +581,104 @@ def run_variant(args, variant, variant_index, device):
         else:
             selected = np.asarray([], dtype=np.int64)
 
+        variant_probe_count += int(probe_count)
         errors = []
         probe_rows = []
+        event_rows = []
         skipped = 0
+        events = 0
         eps = EPS_BY_TENSOR[name] * float(args.eps_mult)
         analytic_flat = scene[name].grad.detach().view(-1)
+        _rms_a, skip_floor = analytic_rms_floor(analytic_flat, candidates, selected)
         for flat_index in selected:
             flat_index = int(flat_index)
-            fd = finite_difference_one(scene, settings, weights, args.loss_terms, name, flat_index, eps)
-            if fd is None or not math.isfinite(fd):
+            fd_values = finite_difference_richardson(
+                scene,
+                settings,
+                weights,
+                args.loss_terms,
+                name,
+                flat_index,
+                eps,
+            )
+            if fd_values is None:
                 skipped += 1
                 continue
 
+            fd_full, fd_half, fd_rich = fd_values
             analytic = float(analytic_flat[flat_index].detach().cpu().item())
-            scale = max(abs(analytic), abs(fd))
-            if scale < 1.0e-6:
+            event_scale = max(abs(fd_full), abs(fd_half), skip_floor)
+            event_delta = abs(fd_full - fd_half) / event_scale
+            is_event = abs(fd_full - fd_half) > RICHARDSON_REL_TOL * event_scale
+            ratio = ratio_fd_over_analytic(fd_rich, analytic)
+            rel_scale = max(abs(analytic), abs(fd_rich))
+            rel_err = abs(analytic - fd_rich) / rel_scale if rel_scale > 0.0 else 0.0
+
+            if is_event:
+                events += 1
+                event_rows.append(
+                    {
+                        "flat_index": flat_index,
+                        "analytic": analytic,
+                        "fd_full": fd_full,
+                        "fd_half": fd_half,
+                        "fd_rich": fd_rich,
+                        "ratio": ratio,
+                        "rel_err": rel_err,
+                        "event": True,
+                        "event_delta": event_delta,
+                    }
+                )
+                continue
+
+            if rel_scale < skip_floor:
                 skipped += 1
                 continue
 
-            rel_err = abs(analytic - fd) / scale
             errors.append(rel_err)
             probe_rows.append(
                 {
                     "flat_index": flat_index,
                     "analytic": analytic,
-                    "fd": float(fd),
-                    "ratio": ratio_fd_over_analytic(float(fd), analytic),
+                    "fd_full": fd_full,
+                    "fd_half": fd_half,
+                    "fd_rich": fd_rich,
+                    "ratio": ratio,
                     "rel_err": rel_err,
+                    "event": False,
+                    "event_delta": event_delta,
                 }
             )
 
         median, p90, max_err = summarize_errors(errors)
-        passed = bool(errors) and median <= 1.0e-2 and p90 <= 5.0e-2
+        if probe_rows:
+            k_med = float(np.median(np.asarray([row["ratio"] for row in probe_rows], dtype=np.float64)))
+        else:
+            k_med = float("inf")
+        sample_min = max(1, min(max(8, int(args.probes) // 3), probe_count))
+        sample_ok = len(errors) >= sample_min
+        scale_ok = 0.98 <= k_med <= 1.02
+        accuracy_ok = bool(errors) and median <= 1.0e-2 and p90 <= 5.0e-2
+        passed = sample_ok and scale_ok and accuracy_ok
         variant_ok = variant_ok and passed
+        variant_event_count += events
+        if not sample_ok:
+            print(
+                "INCONCLUSIVE variant={} tensor={}: n_used={} below required {}; rerun with a higher --probes".format(
+                    variant,
+                    name,
+                    len(errors),
+                    sample_min,
+                )
+            )
         rows.append(
             {
                 "variant": variant,
                 "tensor": name,
                 "n_used": len(errors),
+                "n_event": events,
                 "n_skipped": skipped,
+                "k_med": k_med,
                 "median": median,
                 "p90": p90,
                 "max": max_err,
@@ -527,7 +688,17 @@ def run_variant(args, variant, variant_index, device):
         if args.fit_scale:
             print_fit_scale(variant, name, probe_rows)
         print_probe_rows(variant, name, probe_rows, int(args.dump_worst))
+        print_event_rows(variant, name, event_rows, int(args.dump_worst))
 
+    event_rate = float(variant_event_count) / float(variant_probe_count) if variant_probe_count > 0 else 0.0
+    print(
+        "Variant {}: event rate total = {}/{} ({:.3%})".format(
+            variant,
+            variant_event_count,
+            variant_probe_count,
+            event_rate,
+        )
+    )
     return rows, variant_ok
 
 
@@ -537,7 +708,7 @@ def main():
     parser.add_argument("--n", type=int, default=256)
     parser.add_argument("--height", type=int, default=64)
     parser.add_argument("--width", type=int, default=128)
-    parser.add_argument("--probes", type=int, default=24)
+    parser.add_argument("--probes", type=int, default=32)
     parser.add_argument("--variants", type=str, default="generic,pole,seam")
     parser.add_argument("--loss-terms", type=str, default="color,depth,acc")
     parser.add_argument("--tensors", type=str, default=",".join(TENSOR_NAMES))
