@@ -166,3 +166,9 @@ dataset
 
 # Docs
 docs/
+
+# LLM
+.claude/
+.agents/
+CLAUDE.md
+AGENTS.md
