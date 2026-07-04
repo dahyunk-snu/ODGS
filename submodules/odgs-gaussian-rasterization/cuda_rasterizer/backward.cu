@@ -376,8 +376,10 @@ __global__ void preprocessCUDA(
 	float dist_xz = sqrt(t.x*t.x + t.z*t.z)+0.0000001f;
 	float dist_xz2 = dist_xz * dist_xz;
 
-	const float x_scale = W/(2*M_PI)/dist_xz2;
-	const float y_scale = H/(M_PI)/(dist2*dist_xz);
+	// dL_dmean2D carries renderCUDA's 0.5*W / 0.5*H NDC scale for
+	// densify-stat compatibility; fold the 2/W, 2/H compensation here.
+	const float x_scale = 1.0f/M_PI/dist_xz2;
+	const float y_scale = 2.0f/M_PI/(dist2*dist_xz);
 
 	// That's the second part of the mean gradient. Previous computation
 	// of cov2D and following SH conversion also affects it.
@@ -465,9 +467,6 @@ renderCUDA(
 	const float T_final = inside ? final_Ts[pix_id] : 0;
 	float T = T_final;
 
-	const float Dep = inside ? final_Ds[pix_id] : 0;
-    const float Acc = inside ? final_As[pix_id] : 0;
-
 	// We start from the back. The ID of the last contributing
 	// Gaussian is known from each pixel from the forward.
 	uint32_t contributor = toDo;
@@ -475,12 +474,21 @@ renderCUDA(
 
 	float accum_rec[C] = { 0 };
 	float dL_dpix[C];
+	float dL_dDpix = 0.0f;
+	float dL_dApix = 0.0f;
 	if (inside)
+	{
 		for (int i = 0; i < C; i++)
 			dL_dpix[i] = dL_dpixs[i * H * W + pix_id];
+		dL_dDpix = dL_ddpts[pix_id];
+		dL_dApix = dL_daccs[pix_id];
+	}
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
+	float accum_dep = 0.0f;
+	float last_dep = 0.0f;
+	float accum_acc = 0.0f;
 
 	// Gradient of pixel coordinate w.r.t. normalized
 	// screen-space viewport corrdinates (-1 to 1)
@@ -543,6 +551,7 @@ renderCUDA(
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel pair).
 			float dL_dalpha = 0.0f;
 			const int global_id = collected_id[j];
+			const float dep = f.ey_d.w;
 			for (int ch = 0; ch < C; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];
@@ -557,6 +566,12 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
+			accum_dep = last_alpha * last_dep + (1.f - last_alpha) * accum_dep;
+			last_dep = dep;
+			accum_acc = last_alpha * 1.f + (1.f - last_alpha) * accum_acc;
+			dL_dalpha += (dep - accum_dep) * dL_dDpix;
+			dL_dalpha += (1.0f - accum_acc) * dL_dApix;
+			atomicAdd(&(dL_ddepths[global_id]), dchannel_dcolor * dL_dDpix);
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
